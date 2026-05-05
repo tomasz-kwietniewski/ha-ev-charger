@@ -1,0 +1,12 @@
+# Prywatne dane urządzenia — NIE publikuj!
+ev_charger_secrets.json
+
+# Prywatny kontekst projektu dla Claude Code
+CLAUDE.md
+
+# Dane persystentne
+ev_charger_data.json
+
+# Pliki systemowe
+.DS_Store
+Thumbs.db

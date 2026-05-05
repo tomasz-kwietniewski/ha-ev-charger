@@ -2,10 +2,23 @@ import appdaemon.plugins.hass.hassapi as hass
 import tinytuya
 import json
 import datetime
+import os
 
-DEVICE_ID  = "bffc3e022bd8ef987fhias"
-DEVICE_IP  = "192.168.50.250"
-DEVICE_KEY = "h|p4Nv.-V/U7@Oa3"
+# Dane urządzenia ładowarki — czytane z osobnego pliku secrets
+# Skopiuj ev_charger_secrets.json.example do ev_charger_secrets.json
+# i uzupełnij swoimi danymi. Plik secrets NIE trafia na GitHub.
+_SECRETS_PATH = "/config/ev_charger_secrets.json"
+try:
+    with open(_SECRETS_PATH) as _f:
+        _secrets = json.load(_f)
+    DEVICE_ID  = _secrets["device_id"]
+    DEVICE_IP  = _secrets["device_ip"]
+    DEVICE_KEY = _secrets["device_key"]
+except FileNotFoundError:
+    raise RuntimeError(f"Brak pliku {_SECRETS_PATH} — skopiuj .example i uzupełnij danymi!")
+except KeyError as e:
+    raise RuntimeError(f"Brakuje klucza {e} w {_SECRETS_PATH}")
+
 PROTOCOL   = 3.5
 
 DP_STATUS  = 109

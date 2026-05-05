@@ -457,7 +457,7 @@ Dla porównania — dedykowane ładowarki z zarządzaniem mocą i integracją z 
 
 ## Dla technicznych: kluczowe fragmenty kodu
 
-Pełny skrypt AppDaemon dostępny na moim GitHubie (link wkrótce). Poniżej kluczowe fragmenty:
+Pełny skrypt AppDaemon dostępny na moim GitHubie: [github.com/tomasz-kwietniewski/ha-ev-charger](https://github.com/tomasz-kwietniewski/ha-ev-charger). Dane urządzenia (Device ID, Local Key, IP) trzymam w osobnym pliku `ev_charger_secrets.json` który nie trafia do repozytorium — szablon znajdziesz w repo jako `ev_charger_secrets.json.example`. Poniżej kluczowe fragmenty kodu:
 
 **Pobieranie danych z ładowarki:**
 

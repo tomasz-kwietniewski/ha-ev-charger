@@ -1,0 +1,133 @@
+# Ładuje domyślny zestaw integracji Home Assistant. Nie usuwaj tej linii!
+default_config:
+# Sekcja motywów do frontendu. Motywy ładowane z katalogu 'themes'.
+frontend:
+  themes: !include_dir_merge_named themes
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 172.30.33.0/24
+sensor:
+  - platform: rest
+    name: szambo
+    resource: http://192.168.50.234/state
+    value_template: "{{ value_json.sensors[0].id }}"
+    json_attributes_path: "$.sensors.0"
+    json_attributes:
+      - lvl
+      - pct
+      - lstRead
+      - bat
+  - platform: template
+    sensors:
+      lvl:
+        friendly_name: "Poziom"
+        value_template: "{{ state_attr('sensor.szambo', 'lvl') | float(0) }}"
+        unit_of_measurement: "cm"
+        device_class: "distance"
+      pct:
+        friendly_name: "Procent"
+        value_template: "{{ state_attr('sensor.szambo', 'pct') | float(0) }}"
+        unit_of_measurement: "%"
+      bat:
+        friendly_name: "Bateria"
+        value_template: "{{ state_attr('sensor.szambo', 'bat') | float(0) }}"
+        unit_of_measurement: "%"
+        device_class: "battery"
+      lstread:
+        friendly_name: "Ostatni odczyt (czytelny)"
+        value_template: >-
+          {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
+          {% set t = as_timestamp(t_string) %}
+          {{ t | timestamp_custom('%d %b %H:%M') if t is number else '—' }}
+      lstread_ts:
+        friendly_name: "Ostatni odczyt"
+        value_template: "{{ state_attr('sensor.szambo', 'lstRead') }}"
+        device_class: timestamp
+      mininterval:
+        friendly_name: "Minuty od odczytu"
+        unit_of_measurement: "min"
+        value_template: >-
+          {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
+          {% set t = as_timestamp(t_string) %}
+          {% if t is number %}
+            {{ ((now().timestamp() - t) / 60) | round(0) }}
+          {% else %}
+            unknown
+          {% endif %}
+logger:
+  default: warning
+  logs:
+    # Można usunąć - Local Tuya nie jest używane (ładowarka wymaga protokołu 3.5)
+    # custom_components.localtuya: debug
+template:
+  - sensor:
+      - name: "EV Status Opis"
+        unique_id: ev_status_opis
+        state: >
+          {% set s = states('input_text.ev_charger_status') | upper %}
+          {% if s == 'WORKING' %}Ladowanie
+          {% elif s == 'SLEEP' %}Gotowy (czeka)
+          {% elif s == 'IDLE' %}Niepodlaczone
+          {% elif s == 'PAUSE' %}Pauza
+          {% elif s == 'OFFLINE' %}Offline
+          {% else %}Nieznany
+          {% endif %}
+        icon: >
+          {% set s = states('input_text.ev_charger_status') | upper %}
+          {% if s == 'WORKING' %}mdi:ev-station
+          {% elif s == 'SLEEP' %}mdi:power-plug
+          {% elif s == 'IDLE' %}mdi:power-plug-off
+          {% else %}mdi:help-circle
+          {% endif %}
+      - name: "EV Tryb Opis"
+        unique_id: ev_tryb_opis
+        state: >
+          {% set m = states('input_text.ev_charger_mode') | upper %}
+          {% if m == 'NEGATIVE_PRICE' %}Ujemna cena - max moc
+          {% elif m == 'SOLAR' %}Nadwyzki PV
+          {% elif m == 'BATTERY_PRIORITY' %}Priorytet baterii
+          {% elif m == 'WINTER_NIGHT' %}Nocne ladowanie (zima)
+          {% elif m == 'IDLE' %}Oczekiwanie
+          {% elif m == 'OFFLINE' %}Ladowarka offline
+          {% else %}Nieznany
+          {% endif %}
+        icon: >
+          {% set m = states('input_text.ev_charger_mode') | upper %}
+          {% if m == 'NEGATIVE_PRICE' %}mdi:currency-usd-off
+          {% elif m == 'SOLAR' %}mdi:solar-power
+          {% elif m == 'BATTERY_PRIORITY' %}mdi:battery-charging
+          {% elif m == 'WINTER_NIGHT' %}mdi:weather-night
+          {% else %}mdi:car-electric
+          {% endif %}
+      - name: "EV Moc Ladowania"
+        unique_id: ev_moc_ladowania
+        state: "{{ ((states('input_text.ev_data') | from_json).power | default(0) | float / 1000) | round(2) }}"
+        unit_of_measurement: "kW"
+        icon: mdi:lightning-bolt
+      - name: "EV Prad Ladowania"
+        unique_id: ev_prad_ladowania
+        state: "{{ (states('input_text.ev_data') | from_json).current | default(0) }}"
+        unit_of_measurement: "A"
+        icon: mdi:current-ac
+      - name: "EV Energia Sesja"
+        unique_id: ev_energia_sesja
+        state: "{{ (states('input_text.ev_data') | from_json).session | default(0) }}"
+        unit_of_measurement: "kWh"
+        device_class: energy
+        icon: mdi:battery-charging-outline
+      - name: "EV Energia Miesiac"
+        unique_id: ev_energia_miesiac
+        state: "{{ (states('input_text.ev_data') | from_json).month | default(0) }}"
+        unit_of_measurement: "kWh"
+        device_class: energy
+        icon: mdi:calendar-month
+      - name: "EV Energia Lacznie"
+        unique_id: ev_energia_lacznie
+        state: "{{ (states('input_text.ev_data') | from_json).total | default(0) }}"
+        unit_of_measurement: "kWh"
+        device_class: energy
+        icon: mdi:counter

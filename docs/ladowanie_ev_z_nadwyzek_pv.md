@@ -30,8 +30,6 @@ Przeprowadziłem szczegółową diagnostykę. Połączenie TCP z ładowarką na 
 **Problem 2: Brak UDP discovery**
 Ładowarka nie wysyłała broadcastu UDP discovery, którego Local Tuya oczekuje do automatycznego wykrycia urządzenia w sieci. Nawet ręczne wpisanie IP nie pomagało — integracja nie mogła nawiązać poprawnej sesji.
 
-Po diagnozie napisałem do sprzedawcy ładowarki z raportem technicznym. Odpowiedź: *"dziękujemy, przekażemy do działu technicznego"*. Czekamy na aktualizację Local Tuya lub firmware ładowarki.
-
 **Rozwiązanie: AppDaemon + TinyTuya**
 
 Biblioteka TinyTuya obsługuje protokół 3.5 i połączyła się bez problemów. Uruchomiłem ją przez add-on AppDaemon w Home Assistant, który pozwala instalować paczki Pythona trwale.
@@ -156,14 +154,14 @@ W prostszych przypadkach (np. "ładuj zawsze w nocy 23:00–6:00") można ustawi
 
 Skrypt AppDaemon co 30 sekund sprawdza stan instalacji i podejmuje decyzję. W aktualnej wersji obsługuje pięć trybów pracy:
 
-| Tryb | Warunek | Działanie |
-|------|---------|-----------|
-| `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen |
-| `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na maksimum (16A) |
-| `WINTER_NIGHT` | Tryb zimowy włączony, godz. 22–6 | Ładuj na 10A (tania taryfa nocna) |
-| `SOLAR` | SOC baterii ≥ 95% i nadwyżka PV ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A) |
-| `BATTERY_PRIORITY` | SOC < 95% | Czekaj, priorytet ładowania baterii |
-| `IDLE` | Brak nadwyżek lub auto niepodłączone | Ładowarka wyłączona |
+| Tryb                 | Warunek                                     | Działanie                                                  |
+| -------------------- | ------------------------------------------- | ----------------------------------------------------------- |
+| `EMERGENCY`        | Włączony ręcznie przez toggle w HA       | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen |
+| `NEGATIVE_PRICE`   | Cena Pstryk < 0 zł/kWh                     | Ładuj na maksimum (16A)                                    |
+| `WINTER_NIGHT`     | Tryb zimowy włączony, godz. 22–6         | Ładuj na 10A (tania taryfa nocna)                          |
+| `SOLAR`            | SOC baterii ≥ 95% i nadwyżka PV ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A)                |
+| `BATTERY_PRIORITY` | SOC < 95%                                   | Czekaj, priorytet ładowania baterii                        |
+| `IDLE`             | Brak nadwyżek lub auto niepodłączone     | Ładowarka wyłączona                                      |
 
 Tryby sprawdzane są w kolejności od góry — EMERGENCY ma najwyższy priorytet.
 
@@ -284,14 +282,14 @@ W HA 2026.x API odrzuca encje z atrybutami `unit_of_measurement` i `device_class
 
 Wymagane helpery — tworzone przez UI (Settings → Helpers):
 
-| Typ | Entity ID | Opis |
-|-----|-----------|------|
-| Text | `input_text.ev_charger_status` | Status ładowarki (WORKING/SLEEP/PAUSE...) |
-| Text | `input_text.ev_charger_mode` | Aktywny tryb (SOLAR/EMERGENCY...) |
-| Text | `input_text.ev_data` | JSON z pełnymi danymi sesji |
-| Toggle | `input_boolean.ev_tryb_zimowy` | Tryb zimowy — nocne ładowanie 22–6 |
-| Toggle | `input_boolean.ev_tryb_awaryjny` | Tryb awaryjny — ładuj na maksa teraz |
-| Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (0,5–8h) |
+| Typ    | Entity ID                            | Opis                                       |
+| ------ | ------------------------------------ | ------------------------------------------ |
+| Text   | `input_text.ev_charger_status`     | Status ładowarki (WORKING/SLEEP/PAUSE...) |
+| Text   | `input_text.ev_charger_mode`       | Aktywny tryb (SOLAR/EMERGENCY...)          |
+| Text   | `input_text.ev_data`               | JSON z pełnymi danymi sesji               |
+| Toggle | `input_boolean.ev_tryb_zimowy`     | Tryb zimowy — nocne ładowanie 22–6      |
+| Toggle | `input_boolean.ev_tryb_awaryjny`   | Tryb awaryjny — ładuj na maksa teraz     |
+| Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (0,5–8h)            |
 
 ---
 

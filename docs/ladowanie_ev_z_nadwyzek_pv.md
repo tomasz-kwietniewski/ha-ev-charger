@@ -152,266 +152,146 @@ W prostszych przypadkach (np. "ładuj zawsze w nocy 23:00–6:00") można ustawi
 
 ---
 
-## Logika sterowania
+## Logika sterowania — pięć trybów
 
-Napisałem aplikację AppDaemon (Python działający w ramach Home Assistant), która co 30 sekund:
+Skrypt AppDaemon co 30 sekund sprawdza stan instalacji i podejmuje decyzję. W aktualnej wersji obsługuje pięć trybów pracy:
 
-1. Odpytuje ładowarkę przez TinyTuya (lokalnie)
-2. Sprawdza dane z falownika Sofar (przez Modbus)
-3. Sprawdza aktualną cenę energii Pstryk
-4. Podejmuje decyzję i wysyła polecenie do ładowarki
+| Tryb | Warunek | Działanie |
+|------|---------|-----------|
+| `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen |
+| `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na maksimum (16A) |
+| `WINTER_NIGHT` | Tryb zimowy włączony, godz. 22–6 | Ładuj na 10A (tania taryfa nocna) |
+| `SOLAR` | SOC baterii ≥ 95% i nadwyżka PV ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A) |
+| `BATTERY_PRIORITY` | SOC < 95% | Czekaj, priorytet ładowania baterii |
+| `IDLE` | Brak nadwyżek lub auto niepodłączone | Ładowarka wyłączona |
 
-### Tryby pracy
+Tryby sprawdzane są w kolejności od góry — EMERGENCY ma najwyższy priorytet.
 
-**🔴 BATTERY_PRIORITY** — gdy SOC baterii < 95%
-Bateria ma pierwszeństwo. Ładowarka auta pozostaje wyłączona. Falownik ładuje magazyn z PV.
+### Tryb EMERGENCY — ładowanie awaryjne na maksa
 
-**🟡 SOLAR** — gdy SOC ≥ 95% i nadwyżka PV ≥ 5 kW
-Bateria jest pełna, jest nadwyżka słońca. Włącz ładowanie auta. Reguluj prąd dynamicznie w zależności od dostępnej nadwyżki.
+Dodany po tym jak pewnego dnia wróciłem do domu z prawie pustą baterią auta i za godzinę musiałem jechać znowu. Słońca było mało, a skrypt solarny czekał na nadwyżki.
 
-**🟢 NEGATIVE_PRICE** — gdy cena Pstryk < 0 zł/kWh
-Prąd jest ujemny — czyli operator **płaci** za pobieranie. Ładuj na maksimum (16A = ~11 kW), niezależnie od stanu baterii i PV.
-
-**⚪ IDLE** — brak warunków do ładowania
-Ładowarka wyłączona lub auto niepodłączone.
-
-### Statusy ładowarki
-
-Ładowarka raportuje cztery stany przez DP 109:
-
-- `WORKING` — aktywne ładowanie, auto pobiera prąd
-- `SLEEP` — auto podłączone, ładowanie oczekuje (np. po podłączeniu kabla)
-- `PAUSE` — ładowanie wstrzymane przez zewnętrzną komendę — **to nasz skrypt zatrzymał ładowanie**
-- `IDLE` — ładowarka podłączona do prądu, auto niepodłączone
-
-Różnica między `SLEEP` a `PAUSE` jest istotna: `SLEEP` to stan w którym ładowarka czeka sama z siebie, `PAUSE` to stan w którym zatrzymaliśmy ją my przez komendę `set_value(DP_SWITCH, False)`. Odkryłem to dopiero w praktyce — dokumentacja tego nie opisuje.
-
-### Histereza
-
-Żeby uniknąć ciągłego włączania i wyłączania przy zmiennym nasłonecznieniu:
-
-- **Włącz** ładowanie gdy nadwyżka ≥ 5000 W
-- **Wyłącz** ładowanie gdy nadwyżka < 3500 W
-
-### Regulacja prądu
+Rozwiązanie: przełącznik w dashboardzie HA z timerem. Ustawiasz ile godzin (0,5–8h), włączasz toggle — ładowarka rusza natychmiast na 13A (~9 kW). Nie czeka na słońce, może drenować magazyn (ale zatrzyma się gdy SOC baterii spadnie poniżej 20%). Po upływie czasu automatycznie wraca do trybu normalnego.
 
 ```python
-def _surplus_to_current(self, surplus_w):
-    current = surplus_w / (3 * 230)  # 3 fazy × 230V
-    return max(6, min(16, int(current)))
+EMERGENCY_CURRENT_A = 13   # zostawia ~2 kW bufora na dom przy przyłączu 11 kW
+SOC_EMERGENCY_MIN   = 20   # nie drenuj magazynu poniżej 20%
 ```
 
-Nadwyżka 5000 W → 7A, nadwyżka 11000 W → 16A (max).
+### Znak PCC Sofara — weryfikuj empirycznie
 
-### Korekta pomiaru
+To jedna z ważniejszych pułapek. Sensor `sensor.sofar_modbus_inverter_active_power_pcc_total` może mieć różny znak w zależności od wersji firmware i trybu pracy falownika. W mojej instalacji:
 
-Gdy ładowarka pracuje, jej moc jest wliczona w zużycie domu. Dlatego eksport do sieci jest zaniżony o moc ładowania. Skrypt to koryguje:
+- **Dodatni PCC** = eksport do sieci (nadwyżka)
+- **Ujemny PCC** = import z sieci (brak nadwyżki)
+
+Sprawdź w Developer Tools wartość tego sensora gdy wiesz że eksportujesz (bateria pełna, słońce świeci). Jeśli wartość jest ujemna przy eksporcie — zamień znak w kodzie.
+
+### Uśrednianie PCC — eliminacja migotania
+
+PCC "migocze" — raz -0,1 kW, raz +0,2 kW, raz -0,5 kW — nawet gdy bilans jest w zasadzie zero. To normalne przy hybrydowym falowniku, regulacja nie jest idealna. Bez filtrowania skrypt zmieniałby prąd ładowania co 30 sekund.
+
+Rozwiązanie: uśrednianie z ostatnich 2 odczytów (60 sekund):
 
 ```python
-if charger_working:
-    available_surplus = grid_export + charger_power_w
-else:
-    available_surplus = grid_export
+PCC_HISTORY_SIZE = 2
+
+self._pcc_history.append(grid_power)
+if len(self._pcc_history) > PCC_HISTORY_SIZE:
+    self._pcc_history.pop(0)
+avg_pcc = sum(self._pcc_history) / len(self._pcc_history)
+```
+
+### Bias +1000W — agresywne wykorzystanie nadwyżek
+
+Prąd ładowarki zmienia się skokowo co 690W (1A × 3 fazy × 230V). Żeby skrypt był trochę bardziej "agresywny" i częściej wybierał wyższy prąd, dodałem stały bias +1000W do obliczonej nadwyżki:
+
+```python
+surplus_w = (avg_pcc * 1000 + 1000) if avg_pcc > 0 else 1000
+```
+
+Przy cenie 0,15 zł/kWh to koszt ~15 groszy za godzinę ładowania w zamian za lepsze wykorzystanie słońca. Latem przy cenach bliskich zeru — bez znaczenia.
+
+### Stan PAUSE — ładowarka gotowa ale wstrzymana
+
+Gdy auto jest podłączone ale ładowanie jest wstrzymane (np. przez harmonogram), ładowarka raportuje stan `PAUSE`. Stary kod nie obsługiwał tego stanu i nie wysyłał START — auto stało podłączone ale się nie ładowało.
+
+Rozwiązanie: traktuj `PAUSE` jak `IDLE` — auto jest gotowe do ładowania:
+
+```python
+CHARGER_READY_STATES   = {"PAUSE", "SLEEP", "IDLE", "UNKNOWN"}
+CHARGER_WORKING_STATES = {"WORKING"}
 ```
 
 ---
 
-## Architektura techniczna
+## Pułapki techniczne — kompletna lista
 
-```
-Panele PV → Falownik Sofar → Sieć domowa
-                ↓                    ↓
-          Magazyn 15 kWh      Ładowarka EV (Tuya)
-                                     ↑
-                          Home Assistant (NAS)
-                                     ↑
-                          AppDaemon + TinyTuya
-                                     ↑
-                          Sofar Modbus + Pstryk API
-```
+### Problem 1: Protokół Tuya 3.5
 
-**Home Assistant** zbiera dane ze wszystkich źródeł i wyświetla je na jednym dashboardzie.
+Local Tuya obsługuje tylko do wersji 3.4. Jedyne rozwiązanie: AppDaemon + TinyTuya.
 
-**AppDaemon** to środowisko do uruchamiania skryptów Pythona wewnątrz Home Assistant — idealny do logiki wymagającej ciągłego działania co N sekund.
-
-**TinyTuya** komunikuje się z ładowarką lokalnie przez TCP na porcie 6668, używając szyfrowania AES z lokalnym kluczem.
-
----
-
-## Dashboard w Home Assistant
-
-Po skonfigurowaniu wszystkiego, dashboard pokazuje w jednym miejscu:
-
-- SOC baterii i status magazynu
-- Status ładowarki (Ładowanie / Gotowy / Niepodłączone)
-- Tryb automatyki (Nadwyżki PV / Priorytet baterii / Ujemna cena)
-- Aktualny prąd i moc ładowania
-- Energię naładowaną w sesji, miesiącu i łącznie
-- Produkcję PV, zużycie domu, status sieci
-- Aktualną cenę Pstryk i koszty energii
-
----
-
-## Problemy które napotkałem — i jak je rozwiązałem
-
-Droga do działającego systemu nie była prosta. Oto pułapki na które wpadłem, żebyś Ty nie musiał.
-
-### Problem 1: Klucze DP jako stringi, nie integery
-
-Pierwsza i najbardziej zdradliwa pułapka. Przez długi czas skrypt zwracał `None` dla wszystkich odczytów statusu ładowarki. Kod wyglądał poprawnie, a błąd był niewidoczny:
+### Problem 2: Klucze DP jako stringi
 
 ```python
-status = dps.get(109)  # zawsze None!
+dps.get("109")  # poprawnie
+dps.get(109)    # zawsze None
 ```
 
-**Dlaczego?** TinyTuya deserializuje JSON z ładowarki i zostawia klucze jako stringi — tak jak przyszły. Python nie konwertuje `"109"` na `109` automatycznie. To subtelna różnica między typami która nie rzuca żadnego wyjątku.
+### Problem 3: DP 151 blokuje START
 
-```python
-status = dps.get("109")  # działa!
-```
-
-### Problem 2: Ładowarka nie odpowiada gdy intensywnie ładuje
-
-Gdy auto pobierało pełną moc (~10 kW), skrypt zwracał `status=UNKNOWN` i `moc=0W` — mimo że ładowanie działało prawidłowo i Smart Life pokazywało poprawne dane.
-
-**Dlaczego?** Ładowarka ma jeden procesor obsługujący jednocześnie ładowanie i komunikację sieciową. Przy pełnym obciążeniu nie zdąża odpowiedzieć w domyślnym czasie 5 sekund.
-
-Rozwiązanie: wydłużenie timeoutu i dodanie automatycznego retry:
-
-```python
-self._device.set_socketTimeout(6)
-self._device.set_socketRetryLimit(3)
-
-raw = self._device.status()
-if not raw.get('dps', {}).get('109'):
-    raw = self._device.status()  # drugi strzał
-```
-
-### Problem 3: Ładowarka pikowała co 30 sekund
-
-Skrypt co 30 sekund wysyłał komendę ustawienia prądu — nawet gdy wartość się nie zmieniła. Ładowarka reagowała na każdą komendę sygnałem dźwiękowym. Słyszałem nieustanne pikanie przez uchylone okno.
-
-**Dlaczego?** Ładowarka traktuje każdą przychodzącą komendę jako zdarzenie i potwierdza ją dźwiękiem — niezależnie czy wartość się zmieniła.
-
-Rozwiązanie: zapamiętaj ostatnio wysłaną wartość i wysyłaj tylko gdy coś się zmienia:
-
-```python
-if target_current != self._last_sent_current:
-    self._set_current(target_current)
-    self._last_sent_current = target_current
-```
-
-### Problem 4: AppDaemon nie może tworzyć sensorów z atrybutami
-
-Próbowałem tworzyć sensory przez `set_state()` z atrybutami `unit_of_measurement` i `device_class`. Skrypt działał, ale HA zwracał błąd `400 Bad Request` bez żadnego pomocnego komunikatu.
-
-**Dlaczego?** HA 2026.x zaostrzyło walidację — encje tworzone dynamicznie przez API nie mogą mieć atrybutów zastrzeżonych dla encji zarejestrowanych przez integracje.
-
-Rozwiązanie: zamiast tworzyć sensory przez AppDaemon, zapisuję dane do `input_text` jako JSON, a template sensory w `configuration.yaml` parsują te dane:
-
-```yaml
-- name: "EV Moc Ladowania"
-  state: "{{ (states('input_text.ev_data') | from_json).power | default(0) }}"
-  unit_of_measurement: "W"
-```
-
-### Problem 5: "Duchy" starych encji blokują nowe
-
-Gdy próbowałem zastąpić stare helpery nowymi o tej samej nazwie, HA pamiętał stare encje z bazy danych i wyświetlał je jako `unavailable` — nowe dostawały przyrostek `_2` w nazwie.
-
-**Dlaczego?** HA przechowuje historię wszystkich encji w bazie SQLite. Nawet po usunięciu helpera z konfiguracji, stary wpis w bazie "przejmuje" nazwę i blokuje nowy.
-
-Rozwiązanie: usunięcie starych wpisów bezpośrednio z bazy:
-
-```bash
-sqlite3 /config/home-assistant_v2.db \
-  "DELETE FROM states WHERE entity_id='input_number.ev_charger_power';"
-```
-
-### Problem 6: Znak eksportu w Sofar — nie zakładaj że jest stały
-
-To był najbardziej podstępny problem, bo objawił się dopiero po kilku dniach działania systemu: ładowarka przestała reagować na nadwyżki PV mimo że słońce świeciło i bateria była pełna. Logi pokazywały `eksport=0W`, dashboard pokazywał eksport 6.5 kW.
-
-**Dlaczego?** Sensor `sofar_modbus_inverter_active_power_pcc_total` zmienił znak eksportu po zmianie trybu pracy falownika. Sofar HYD nie ma jednej ustalonej konwencji — w trybie Self-use eksport był u mnie wartością ujemną, po przełączeniu na Time of Use stał się dodatnią. Nie jest to opisane w dokumentacji. To znane zjawisko wśród użytkowników Sofara w społeczności Home Assistant.
-
-Historia w kodzie:
-
-```python
-# Pierwotnie — eksport ujemny (tryb Self-use)
-surplus_w = max(0, -grid_power * 1000)
-
-# Po zmianie trybu na Time of Use — eksport dodatni
-surplus_w = max(0, grid_power * 1000)   # ← aktualna wersja
-```
-
-**Czy może się powtórzyć?** Tak. Jeśli zmienisz tryb pracy falownika (np. przełączysz na Passive Mode do testów) lub wgrasz aktualizację firmware — znak może się odwrócić i skrypt przestanie ładować auto mimo słońca.
-
-**Jak sprawdzić gdy coś nie działa:** Wejdź w HA Developer Tools → States → wyszukaj `sofar_modbus_inverter_active_power_pcc_total`. Gdy wiesz że eksportujesz do sieci (słońce świeci, bateria pełna) — sprawdź czy wartość jest dodatnia czy ujemna. Jeśli ujemna, zmień w skrypcie `grid_power * 1000` na `-grid_power * 1000` i zrestartuj AppDaemon.
-
-### Problem 7: Jednostki w DP 102 nie są oczywiste
-
-Przez długi czas odczytywałem moc z pola `L1[2]` i dostawałem wartość 32 — myśląc że to 32W. Tymczasem ładowarka pobierała ~3200W na fazę.
-
-**Dlaczego?** Ładowarka zwraca moc w skali ×100 — bez żadnej dokumentacji która by to wyjaśniała. Odkryłem to porównując wartość `"p": 98` z aplikacją Smart Life która pokazywała 9,8 kW — czyli 98 × 100 = 9800W. Zawsze weryfikuj jednostki DP z innym źródłem.
-
----
-
-### Problem 8: Harmonogram w ładowarce blokuje START
-
-Po kilku dniach testów ładowarka wchodziła w stan PAUSE i nie reagowała na komendy START z AppDaemon mimo że wszystkie warunki były spełnione (SOC=100%, nadwyżka PV=6.5 kW).
-
-**Dlaczego?** Ładowarka miała zapisany harmonogram ładowania (DP 151) ustawiony domyślnie przez aplikację Smart Life: `{"ss":"15:00","se":"17:00"}`. Poza oknem 15:00-17:00 ładowarka automatycznie przechodziła w PAUSE i ignorowała zewnętrzne komendy START — nawet gdy harmonogram był "wyłączony" w UI aplikacji.
-
-Rozwiązanie — wyczyść harmonogram przez TinyTuya:
+Ładowarka ma wbudowany harmonogram (DP 151). Gdy harmonogram jest aktywny, ładowarka ignoruje zewnętrzne komendy START i pozostaje w PAUSE. Rozwiązanie — wyczyść harmonogram przy każdym starcie:
 
 ```python
 self._device.set_value("151", json.dumps({"m":0,"dt":0,"ss":"00:00","se":"00:00"}))
 ```
 
-I dodaj to czyszczenie przy każdym starcie skryptu w metodzie `initialize()` — żeby harmonogram nigdy nie blokował automatyki.
+### Problem 4: Znak PCC zmienia się po zmianie trybu Sofara
 
-### Problem 9: Eksport = 0W gdy auto ładuje — błędna logika zatrzymania
+Po zmianie trybu falownika (np. z Self-use na Time of Use) znak PCC może się odwrócić. Zawsze weryfikuj empirycznie po każdej zmianie konfiguracji falownika.
 
-Gdy ładowarka pracowała i pobierała np. 5 kW z nadwyżki PV, eksport do sieci wynosił 0W (bo auto brało całą nadwyżkę). Skrypt interpretował `eksport=0W` jako brak nadwyżki i wysyłał STOP — co było błędem.
+### Problem 5: Moc DP 102 mnożona x100
 
-**Dlaczego?** Logika korekty była:
+`L1[2]`, `L2[2]`, `L3[2]` to moc per faza w jednostkach x100W. Wartość `32` oznacza 3200W, nie 32W.
 
-```python
-available_surplus = eksport + moc_auta  # np. 0 + 5000 = 5000W
-```
+### Problem 6: Stan PAUSE ignorowany
 
-Ale jednocześnie warunek zatrzymania sprawdzał `available_surplus < 3500W` — co dawało 5000W > 3500W, więc powinno działać. Problem był subtelniejszy: gdy Sofar raportował eksport=0 i jednocześnie moc auta=0 (bo ładowarka była w PAUSE i nie mierzyła prądu), skrypt liczył `0 + 0 = 0W` i zatrzymywał ładowanie.
+Gdy auto podłączone ale harmonogram wstrzymał ładowanie — ładowarka raportuje PAUSE. Stary kod nie wysyłał START w tym stanie.
 
-Rozwiązanie: gdy auto jest w WORKING i eksport bliski zeru (< 500W), nie zatrzymuj ładowania — to znaczy że ładowarka idealnie bilansuje produkcję z poborem:
+### Problem 7: Uśrednianie PCC konieczne
 
-```python
-if charger_working and surplus < 500:
-    available_surplus = STOP_SURPLUS_W + 100  # nie zatrzymuj
-```
+Bez filtrowania migające wartości PCC powodują chaotyczne zmiany prądu co 30 sekund.
 
-Efekt końcowy: auto ładuje się z nadwyżek PV, eksport = 0W (ładowarka bierze dokładnie tyle ile produkują panele), sieć zbilansowana.
+### Problem 8: Próg startu za wysoki
 
-To równie ważna część artykułu. Oto ścieżki które wyglądają sensownie, ale prowadzą donikąd.
+Pierwotny próg START_SURPLUS_W = 5000W był za wysoki — system nie startował przy nadwyżkach 3–4 kW. Aktualny próg: 1600W (odpowiada dokładnie minimalnemu prądowi 6A × 3 × 230V).
 
-### Nie używaj chmury Tuya do sterowania
+### Problem 9: Serwery Tuya dla Polski
 
-Darmowy plan Tuya IoT Platform ma limit ~1000 zapytań dziennie. Przy odpytywaniu co 30 sekund to 2880 zapytań — przekroczysz limit przed południem. Chmura jest potrzebna **tylko raz** do pobrania Local Key. Potem wyłącz i zapomnij, używaj TinyTuya lokalnie.
+Dla europejskich użytkowników dane trafiają na serwer w **Frankfurcie** (AWS). Nie w Chinach. To ważne przy konfiguracji Tuya IoT Platform — wybierz region "Central Europe".
 
-### Nie próbuj sterować przez integrację Tuya/Xtend Tuya w HA
+### Problem 10: Helpery tylko przez UI
 
-Xtend Tuya jest świetna do prostego włącz/wyłącz przez UI. Ale do dynamicznego sterowania co 30 sekund z logiką zależną od wielu sensorów — jest zbyt ograniczona. AppDaemon + TinyTuya daje pełną kontrolę.
+Encje zdefiniowane w YAML są read-only dla serwisów HA. Twórz helpery wyłącznie przez UI (Settings → Helpers → Add).
 
-### Nie twórz sensorów dynamicznie przez AppDaemon set_state()
+### Problem 11: Nie twórz sensorów przez AppDaemon set_state()
 
-W starszych wersjach HA to działało. W HA 2026.x API odrzuca encje z atrybutami `unit_of_measurement` i `device_class` tworzonymi przez AppDaemon — błąd `400 Bad Request` bez pomocnego komunikatu. Straciłem na tym sporo czasu.
+W HA 2026.x API odrzuca encje z atrybutami `unit_of_measurement` i `device_class` tworzonymi przez AppDaemon. Używaj `input_text` jako pośrednika i template sensorów w `configuration.yaml`.
 
-### Nie definiuj helperów w configuration.yaml jeśli chcesz je modyfikować programowo
+---
 
-Encje zdefiniowane w YAML są read-only dla serwisów HA — zawsze pokazują `unavailable` gdy próbujesz je zmienić przez `call_service`. Twórz helpery wyłącznie przez UI (Settings → Helpers → Add).
+## Helpery w Home Assistant
 
-### Nie ignoruj histerzy
+Wymagane helpery — tworzone przez UI (Settings → Helpers):
 
-Bez histerzy przy zmiennym nasłonecznieniu ładowarka włącza i wyłącza się co kilka minut. Ładowarka piszczy, auto się denerwuje. Histereza (włącz przy 5 kW, wyłącz przy 3,5 kW) rozwiązuje problem.
+| Typ | Entity ID | Opis |
+|-----|-----------|------|
+| Text | `input_text.ev_charger_status` | Status ładowarki (WORKING/SLEEP/PAUSE...) |
+| Text | `input_text.ev_charger_mode` | Aktywny tryb (SOLAR/EMERGENCY...) |
+| Text | `input_text.ev_data` | JSON z pełnymi danymi sesji |
+| Toggle | `input_boolean.ev_tryb_zimowy` | Tryb zimowy — nocne ładowanie 22–6 |
+| Toggle | `input_boolean.ev_tryb_awaryjny` | Tryb awaryjny — ładuj na maksa teraz |
+| Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (0,5–8h) |
 
 ---
 
@@ -422,20 +302,18 @@ Bez histerzy przy zmiennym nasłonecznieniu ładowarka włącza i wyłącza się
 System jest zaprojektowany na cały rok z jednym przełącznikiem sezonowym.
 
 **Lato (kwiecień–wrzesień):**
-Polska ma dobre nasłonecznienie — 9 kWp produkuje regularnie nadwyżki powyżej 5 kW. Auto ładuje się za darmo z nadwyżek PV. Przy ujemnych cenach Pstryk (które latem zdarzają się regularnie w południe) system ładuje na maksimum — operator energii dopłaca za pobieranie prądu.
+Polska ma dobre nasłonecznienie — 9 kWp produkuje regularnie nadwyżki powyżej 1,6 kW. Auto ładuje się za darmo z nadwyżek PV. Przy ujemnych cenach Pstryk (które latem zdarzają się regularnie w południe) system ładuje na maksimum — operator energii dopłaca za pobieranie prądu.
 
 **Zima (październik–marzec):**
-Krótkie dni, niskie słońce — nadwyżki PV są rzadkie i małe. Jednocześnie od października obowiązuje taryfa G12W z tanią energią nocną (~0.70 zł/kWh vs ~0.85 zł/kWh w dzień). Włączam jeden przełącznik w HA — `❄️ Tryb zimowy` — i skrypt automatycznie ładuje auto w nocy między 22:00 a 6:00 na 10A (~2.3 kW).
+Krótkie dni, niskie słońce — nadwyżki PV są rzadkie i małe. Jednocześnie od października planowana jest taryfa G12W z tanią energią nocną (~0,70 zł/kWh vs ~0,85 zł/kWh w dzień). Włączam jeden przełącznik w HA — `❄️ Tryb zimowy` — i skrypt automatycznie ładuje auto w nocy między 22:00 a 6:00 na 10A (~6,9 kW).
 
-Dlaczego 10A a nie 16A? Zimą działają pompy ciepła powietrze-powietrze które mogą pobierać łącznie 3-4 kW. Przy przyłączu 11 kW zostaje bezpiecznie ~7 kW na auto, ale przyjąłem 10A (2.3 kW) jako bezpieczny bufor na szczyty poboru (gotowanie, bojler, klimatyzatory).
+Dlaczego 10A a nie 16A? Zimą działają pompy ciepła powietrze-powietrze które mogą pobierać łącznie 3–4 kW. Przy przyłączu 11 kW zostaje bezpiecznie ~7 kW na auto, ale przyjąłem 10A (6,9 kW) jako bezpieczny bufor na szczyty poboru (gotowanie, bojler, klimatyzatory).
 
 Słoneczne dni zimą? Skrypt nadal wykrywa nadwyżki PV i uruchamia tryb SOLAR automatycznie — tryb zimowy dodaje tylko nocne okno ładowania, nie wyłącza logiki solarnej.
 
-Przełączenie jest ręczne — 1 października włączam, 1 kwietnia wyłączam. Można to zautomatyzować przez automatyzację HA opartą na dacie, ale wolę mieć kontrolę i obserwować jak system zachowuje się w różnych warunkach.
-
 **Przy ujemnych cenach Pstryk** (które latem zdarzają się regularnie w godzinach 10:00–16:00) system automatycznie ładuje auto na maksimum. W majowy dzień cena spadła do -0,60 zł/kWh — za każdą godzinę ładowania (9,8 kWh) operator energii **płacił mi** 5,88 zł zamiast żebym ja płacił.
 
-**Ładowanie z nadwyżek** działa dokładnie tak jak planowałem — gdy bateria jest pełna i słońce produkuje więcej niż potrzeba, auto dostaje resztę. Prąd reguluje się co 30 sekund.
+**Ładowanie z nadwyżek** działa dokładnie tak jak planowałem — gdy bateria jest pełna i słońce produkuje więcej niż potrzeba, auto dostaje resztę. Prąd reguluje się co 30 sekund, typowo oscyluje w zakresie 8–12A przy produkcji PV 8 kW.
 
 ---
 
@@ -459,14 +337,17 @@ Dla porównania — dedykowane ładowarki z zarządzaniem mocą i integracją z 
 
 Pełny skrypt AppDaemon dostępny na moim GitHubie: [github.com/tomasz-kwietniewski/ha-ev-charger](https://github.com/tomasz-kwietniewski/ha-ev-charger). Dane urządzenia (Device ID, Local Key, IP) trzymam w osobnym pliku `ev_charger_secrets.json` który nie trafia do repozytorium — szablon znajdziesz w repo jako `ev_charger_secrets.json.example`. Poniżej kluczowe fragmenty kodu:
 
-**Pobieranie danych z ładowarki:**
+**Odczyt danych z ładowarki z obsługą PAUSE:**
 
 ```python
+CHARGER_READY_STATES   = {"PAUSE", "SLEEP", "IDLE", "UNKNOWN"}
+CHARGER_WORKING_STATES = {"WORKING"}
+
 def _get_charger_data(self):
     raw = self._device.status()
     dps = raw.get("dps", {})
 
-    status = str(dps.get("109", "unknown")).upper()
+    status  = str(dps.get("109", "unknown")).upper()
     current = int(dps.get("150", 0))
 
     metrics = json.loads(dps.get("102", "{}"))
@@ -478,25 +359,69 @@ def _get_charger_data(self):
     return {"status": status, "current_a": current, "power_w": power_w}
 ```
 
-**Logika decyzyjna:**
+**Obliczanie nadwyżki z uśrednianiem PCC:**
+
+```python
+# Sofar: dodatni PCC = eksport (nadwyżka), ujemny = import
+# Uśredniamy ostatnie 2 odczyty żeby wyeliminować migotanie
+self._pcc_history.append(grid_power)
+if len(self._pcc_history) > PCC_HISTORY_SIZE:
+    self._pcc_history.pop(0)
+avg_pcc = sum(self._pcc_history) / len(self._pcc_history)
+
+# Bias +1000W — agresywniejsze wykorzystanie nadwyżek
+surplus_w = (avg_pcc * 1000 + 1000) if avg_pcc > 0 else 1000
+```
+
+**Logika decyzyjna z pięcioma trybami:**
 
 ```python
 def _decide(self, ha_data, charger_data):
-    price = ha_data["price"]
-    soc = ha_data["soc"]
-    surplus = ha_data["surplus_w"]
+    # 1. EMERGENCY — najwyższy priorytet
+    if self._is_emergency_active():
+        if soc < SOC_EMERGENCY_MIN:
+            return ("BATTERY_PRIORITY", 0)
+        return ("EMERGENCY", EMERGENCY_CURRENT_A)  # 13A
 
+    # 2. Ujemna cena energii
     if price < 0:
-        return ("NEGATIVE_PRICE", 16)
+        return ("NEGATIVE_PRICE", MAX_CURRENT_A)  # 16A
 
-    if soc < 95:
+    # 3. Tryb zimowy — nocne ładowanie
+    if winter_mode and in_night_window:
+        return ("WINTER_NIGHT", WINTER_MAX_CURRENT)  # 10A
+
+    # 4. Ochrona baterii
+    if soc < SOC_THRESHOLD:  # 95%
         return ("BATTERY_PRIORITY", 0)
 
-    if surplus >= 5000:
-        current = max(6, min(16, int(surplus / (3 * 230))))
+    # 5. Tryb solarny
+    if available_surplus >= START_SURPLUS_W:  # 1600W
+        current = max(6, min(16, int(available_surplus / (3 * 230))))
         return ("SOLAR", current)
 
     return ("IDLE", 0)
+```
+
+**Tryb EMERGENCY z automatycznym timerem:**
+
+```python
+def _on_emergency_toggle(self, entity, attribute, old, new, kwargs):
+    if new == "on":
+        hours = self._get_emergency_hours()  # z input_number
+        self._emergency_end_time = datetime.datetime.now() + datetime.timedelta(hours=hours)
+        self._clear_schedule()  # wyczyść harmonogram przed startem
+    else:
+        self._emergency_end_time = None
+
+def _is_emergency_active(self):
+    if self.get_state(EMERGENCY_MODE_ENTITY) != "on":
+        return False
+    if datetime.datetime.now() > self._emergency_end_time:
+        # Czas minął — wyłącz automatycznie
+        self.call_service("input_boolean/turn_off", entity_id=EMERGENCY_MODE_ENTITY)
+        return False
+    return True
 ```
 
 ---
@@ -505,10 +430,12 @@ def _decide(self, ha_data, charger_data):
 
 Inteligentne ładowanie auta elektrycznego z nadwyżek PV nie wymaga drogiego sprzętu. Wystarczy:
 
-1. Tania ładowarka z Wi-Fi i protokołem Tuya
+1. Tania ładowarka z Wi-Fi i protokołem Tuya (~1150 zł)
 2. Home Assistant jako centrum automatyki
 3. Biblioteka TinyTuya do lokalnej kontroli
 4. Trochę Pythona w AppDaemon
+
+System obsługuje pięć trybów pracy: solarny (proporcjonalnie do nadwyżek), awaryjny (ładuj teraz na maksa), ujemne ceny (operator płaci), zimowy (nocna taryfa) i priorytet baterii. Wszystko sterowane z poziomu dashboardu HA.
 
 Efekt: auto ładuje się za darmo gdy świeci słońce, a przy ujemnych cenach Pstryk — operator energii dopłaca za to, że pobieramy prąd.
 
@@ -516,4 +443,4 @@ Latem planujemy naładować całą baterię 75 kWh praktycznie bez kosztów. Pol
 
 ---
 
-*Artykuł napisany na podstawie rzeczywistej instalacji, maj 2026.*
+*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W.*

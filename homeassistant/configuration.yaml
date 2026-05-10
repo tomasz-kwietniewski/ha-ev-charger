@@ -1,15 +1,45 @@
 # Ładuje domyślny zestaw integracji Home Assistant. Nie usuwaj tej linii!
 default_config:
+
 # Sekcja motywów do frontendu. Motywy ładowane z katalogu 'themes'.
 frontend:
   themes: !include_dir_merge_named themes
+
 automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
+
 http:
   use_x_forwarded_for: true
   trusted_proxies:
     - 172.30.33.0/24
+
+# Zachowaj historię ważnych sensorów przez 365 dni
+recorder:
+  purge_keep_days: 365
+  include:
+    entities:
+      - sensor.zuzycie_domu_miesiac
+      - sensor.produkcja_pv_miesiac
+      - sensor.import_z_sieci_miesiac
+      - sensor.eksport_do_sieci_miesiac
+      - sensor.samowystarczalnosc_miesiac
+      - sensor.samowystarczalnosc_dzis
+      - sensor.sofar_logger_today_production
+      - sensor.sofar_logger_today_load_consumption
+      - sensor.sofar_logger_today_energy_import
+      - sensor.sofar_logger_today_energy_export
+      - sensor.sofar_modbus_battery_1_1_soc
+      - sensor.ev_energia_miesiac
+      - sensor.ev_energia_lacznie
+      - sensor.koszt_energii_dzis
+      - sensor.realny_koszt_kwh_dzis
+      - sensor.miesieczne_saldo_energii
+      - sensor.miesieczny_koszt_zakupu
+      - sensor.miesieczny_przychod_sprzedazy
+      - sensor.energia_pobrana_miesiecznie
+      - sensor.energia_sprzedana_miesiecznie
+
 sensor:
   - platform: rest
     name: szambo
@@ -58,11 +88,32 @@ sensor:
           {% else %}
             unknown
           {% endif %}
+
 logger:
   default: warning
   logs:
-    # Można usunąć - Local Tuya nie jest używane (ładowarka wymaga protokołu 3.5)
     # custom_components.localtuya: debug
+
+# Utility meter — miesięczne liczniki z Sofara
+# Resetują się automatycznie 1. dnia każdego miesiąca
+utility_meter:
+  zuzycie_domu_miesiac:
+    source: sensor.sofar_logger_today_load_consumption
+    name: "Zużycie domu miesiąc"
+    cycle: monthly
+  produkcja_pv_miesiac:
+    source: sensor.sofar_logger_today_production
+    name: "Produkcja PV miesiąc"
+    cycle: monthly
+  import_z_sieci_miesiac:
+    source: sensor.sofar_logger_today_energy_import
+    name: "Import z sieci miesiąc"
+    cycle: monthly
+  eksport_do_sieci_miesiac:
+    source: sensor.sofar_logger_today_energy_export
+    name: "Eksport do sieci miesiąc"
+    cycle: monthly
+
 template:
   - sensor:
       - name: "EV Status Opis"
@@ -83,12 +134,14 @@ template:
           {% elif s == 'IDLE' %}mdi:power-plug-off
           {% else %}mdi:help-circle
           {% endif %}
+
       - name: "EV Tryb Opis"
         unique_id: ev_tryb_opis
         state: >
           {% set m = states('input_text.ev_charger_mode') | upper %}
           {% if m == 'NEGATIVE_PRICE' %}Ujemna cena - max moc
           {% elif m == 'SOLAR' %}Nadwyzki PV
+          {% elif m == 'EMERGENCY' %}Tryb awaryjny - max moc
           {% elif m == 'BATTERY_PRIORITY' %}Priorytet baterii
           {% elif m == 'WINTER_NIGHT' %}Nocne ladowanie (zima)
           {% elif m == 'IDLE' %}Oczekiwanie
@@ -99,35 +152,71 @@ template:
           {% set m = states('input_text.ev_charger_mode') | upper %}
           {% if m == 'NEGATIVE_PRICE' %}mdi:currency-usd-off
           {% elif m == 'SOLAR' %}mdi:solar-power
+          {% elif m == 'EMERGENCY' %}mdi:lightning-bolt
           {% elif m == 'BATTERY_PRIORITY' %}mdi:battery-charging
           {% elif m == 'WINTER_NIGHT' %}mdi:weather-night
           {% else %}mdi:car-electric
           {% endif %}
+
       - name: "EV Moc Ladowania"
         unique_id: ev_moc_ladowania
         state: "{{ ((states('input_text.ev_data') | from_json).power | default(0) | float / 1000) | round(2) }}"
         unit_of_measurement: "kW"
         icon: mdi:lightning-bolt
+
       - name: "EV Prad Ladowania"
         unique_id: ev_prad_ladowania
         state: "{{ (states('input_text.ev_data') | from_json).current | default(0) }}"
         unit_of_measurement: "A"
         icon: mdi:current-ac
+
       - name: "EV Energia Sesja"
         unique_id: ev_energia_sesja
         state: "{{ (states('input_text.ev_data') | from_json).session | default(0) }}"
         unit_of_measurement: "kWh"
         device_class: energy
         icon: mdi:battery-charging-outline
+
       - name: "EV Energia Miesiac"
         unique_id: ev_energia_miesiac
         state: "{{ (states('input_text.ev_data') | from_json).month | default(0) }}"
         unit_of_measurement: "kWh"
         device_class: energy
         icon: mdi:calendar-month
+
       - name: "EV Energia Lacznie"
         unique_id: ev_energia_lacznie
         state: "{{ (states('input_text.ev_data') | from_json).total | default(0) }}"
         unit_of_measurement: "kWh"
         device_class: energy
         icon: mdi:counter
+
+      # Samowystarczalność dziś (dane z Sofara)
+      # = (zużycie domu dziś - pobrano z sieci dziś) / zużycie domu dziś * 100%
+      - name: "Samowystarczalnosc Dzis"
+        unique_id: samowystarczalnosc_dzis
+        state: >
+          {% set zuzycie = states('sensor.sofar_logger_today_load_consumption') | float(0) %}
+          {% set import = states('sensor.sofar_logger_today_energy_import') | float(0) %}
+          {% if zuzycie > 0 %}
+            {{ ((zuzycie - import) / zuzycie * 100) | round(1) }}
+          {% else %}
+            0
+          {% endif %}
+        unit_of_measurement: "%"
+        icon: mdi:home-percent
+
+      # Samowystarczalność miesiąc (dane z Sofara)
+      # = (zużycie domu - pobrano z sieci) / zużycie domu * 100%
+      - name: "Samowystarczalnosc Miesiac"
+        unique_id: samowystarczalnosc_miesiac
+        state: >
+          {% set zuzycie = states('sensor.zuzycie_domu_miesiac') | float(0) %}
+          {% set import = states('sensor.import_z_sieci_miesiac') | float(0) %}
+          {% if zuzycie > 0 %}
+            {{ ((zuzycie - import) / zuzycie * 100) | round(1) }}
+          {% else %}
+            0
+          {% endif %}
+        unit_of_measurement: "%"
+        icon: mdi:home-percent

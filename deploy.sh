@@ -13,7 +13,7 @@ NC='\033[0m'
 # ── Config ────────────────────────────────────────────────────────────────────
 SSH_HOST="ha"
 HA_APPS_DIR="/addon_configs/a0d7b954_appdaemon/apps"
-HA_BACKUP_DIR="/addon_configs/a0d7b954_appdaemon/apps/_backups"
+HA_BACKUP_DIR="/addon_configs/a0d7b954_appdaemon/_backups"
 ADDON_SLUG="a0d7b954_appdaemon"
 MAX_BACKUPS=10
 RESTART_WAIT=20

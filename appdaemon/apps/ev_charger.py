@@ -4,7 +4,11 @@ import json
 import datetime
 import os
 
-# Dane urządzenia ładowarki — czytane z osobnego pliku secrets
+# Dane urządzenia ładowarki — czytane z osobnego pliku secrets.
+# UWAGA na mapowanie ścieżek AppDaemon: w środowisku add-onu "/config/"
+# mapuje się na katalog add-onu (/addon_configs/a0d7b954_appdaemon/),
+# NIE na główny katalog HA (/config/). Aktywny plik sekretów to:
+#   /addon_configs/a0d7b954_appdaemon/ev_charger_secrets.json
 _SECRETS_PATH = "/config/ev_charger_secrets.json"
 try:
     with open(_SECRETS_PATH) as _f:

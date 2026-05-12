@@ -39,7 +39,13 @@ appdaemon:
 
 ### Krok 2 — Secrets
 
-Skopiuj `ev_charger_secrets.json.example` do `ev_charger_secrets.json` i uzupełnij danymi urządzenia:
+Skopiuj `ev_charger_secrets.json.example` jako `ev_charger_secrets.json` do katalogu add-onu AppDaemon i uzupełnij danymi urządzenia:
+
+```
+/addon_configs/a0d7b954_appdaemon/ev_charger_secrets.json
+```
+
+> **Ważne:** AppDaemon mapuje `/config/` na swój własny katalog add-onu (`/addon_configs/a0d7b954_appdaemon/`), **nie** na główny `/config/` HA. Plik sekretów musi leżeć w katalogu add-onu, a nie w `/config/`.
 
 ```json
 {
@@ -50,6 +56,8 @@ Skopiuj `ev_charger_secrets.json.example` do `ev_charger_secrets.json` i uzupeł
 ```
 
 Jak pobrać Local Key — [instrukcja w dokumentacji TinyTuya](https://github.com/jasonacox/tinytuya#setup-wizard---getting-local-keys).
+
+> **Jeśli masz plik w obu lokalizacjach** (`/config/ev_charger_secrets.json` i `/addon_configs/.../ev_charger_secrets.json`) — ten w `/config/` jest martwym artefaktem i można go usunąć. AppDaemon go nie widzi.
 
 ### Krok 3 — Skrypt
 
@@ -94,9 +102,10 @@ SOC_EMERGENCY_MIN = 20   # [%] w trybie EMERGENCY zatrzymaj gdy SOC < tej warto�
 MIN_CURRENT_A     = 6    # [A] minimum ładowarki
 MAX_CURRENT_A     = 16   # [A] maksimum ładowarki
 EMERGENCY_CURRENT_A = 13 # [A] tryb emergency (~9 kW, bufor 2 kW na dom)
-START_SURPLUS_W   = 1600 # [W] min nadwyżka do startu (= 6A * 3 * 230V)
+START_SURPLUS_W   = 1600 # [W] min nadwyżka do startu (razem z SURPLUS_BIAS_W)
 STOP_SURPLUS_W    = 1200 # [W] poniżej - zatrzymaj ładowanie (histereza)
-PCC_HISTORY_SIZE  = 2    # ile odczytów uśredniać (2 * 30s = 60s)
+SURPLUS_BIAS_W    = 1000 # [W] bufor doliczany do PCC — start już przy ~0,6 kW eksportu
+PCC_HISTORY_SIZE  = 3    # ile odczytów uśredniać (3 * 30s = 90s)
 ```
 
 ## Struktura plików
@@ -137,6 +146,30 @@ ha-ev-charger/
 - **Serwery Tuya dla Polski** — region "Central Europe", serwer Frankfurt AWS (nie Chiny)
 
 Szczegóły w `docs/ladowanie_ev_z_nadwyzek_pv.md`.
+
+## Konfiguracja środowiskowa
+
+Plik `appdaemon.yaml` nie jest w repo (konfiguracja środowiskowa). Po instalacji ustaw lokalizację i strefę czasową na wartości ze swojego HA (Settings → System → General):
+
+```yaml
+appdaemon:
+  latitude: 52.1234       # Twoja szerokość geograficzna
+  longitude: 20.5678      # Twoja długość geograficzna
+  elevation: 95           # Wysokość n.p.m. [m]
+  time_zone: Europe/Warsaw
+```
+
+Domyślna konfiguracja AppDaemon może mieć ustawione Amsterdam (`latitude: 52.38`, `longitude: 4.90`, `time_zone: Europe/Amsterdam`) — to błędne wartości dla Polski, które mogą wpłynąć na obliczenia astronomiczne (wschód/zachód słońca) jeśli je kiedyś używasz.
+
+## Debugowanie
+
+Logi AppDaemon (terminal HA lub SSH):
+
+```bash
+ha addons logs a0d7b954_appdaemon
+```
+
+> **Uwaga:** AppDaemon loguje przez supervisor HA, **nie** do pliku `.log` na dysku. Komenda powyżej to jedyna pewna droga do logów.
 
 ## Licencja
 

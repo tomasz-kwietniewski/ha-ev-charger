@@ -281,6 +281,14 @@ Encje zdefiniowane w YAML są read-only dla serwisów HA. Twórz helpery wyłąc
 
 W HA 2026.x API odrzuca encje z atrybutami `unit_of_measurement` i `device_class` tworzonymi przez AppDaemon. Używaj `input_text` jako pośrednika i template sensorów w `configuration.yaml`.
 
+### Problem 12: AppDaemon skanuje folder apps/ rekurencyjnie
+
+AppDaemon ładuje wszystkie pliki `.yaml` z folderu `apps/` — łącznie z podfolderami. Jeśli wewnątrz `apps/` umieścisz backup z poprzednim `apps.yaml`, AppDaemon załaduje go razem z aktualnym i uruchomi duplikaty wszystkich aplikacji.
+
+W praktyce wygląda to tak: masz jeden skrypt sterujący ładowarką, a działają dwie instancje — każda wysyła komendy do ładowarki co 30 sekund, wzajemnie sobie przeszkadzając. W logach zobaczysz dwa razy `Calling initialize() for ev_charger_*` przy starcie.
+
+Rozwiązanie: trzymaj backupy **poza** folderem `apps/`, np. w `addon_configs/a0d7b954_appdaemon/_backups/`.
+
 ---
 
 ## Helpery w Home Assistant
@@ -449,4 +457,4 @@ Latem planujemy naładować całą baterię 75 kWh praktycznie bez kosztów. Pol
 
 ---
 
-*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC.*
+*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu).*

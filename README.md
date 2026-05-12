@@ -147,6 +147,20 @@ ha-ev-charger/
 
 Szczegóły w `docs/ladowanie_ev_z_nadwyzek_pv.md`.
 
+## Deploy
+
+Po każdej zmianie kodu użyj skryptu deploy (wymaga Git Bash lub WSL, SSH alias `ha` w `~/.ssh/config`):
+
+```bash
+./deploy.sh            # deploy z potwierdzeniem
+./deploy.sh --force    # bez pytania (np. w skryptach)
+./deploy.sh --dry-run  # podgląd planu bez zmian
+```
+
+Skrypt automatycznie: sprawdza składnię Python, tworzy backup z timestampem w `/addon_configs/a0d7b954_appdaemon/_backups/`, wgrywa pliki przez `scp`, restartuje AppDaemon i weryfikuje logi. W razie błędu oferuje rollback.
+
+> **Uwaga:** backupy muszą leżeć **poza** folderem `apps/` — AppDaemon skanuje go rekurencyjnie i załadowałby stare pliki YAML z backupu jako dodatkowe aplikacje.
+
 ## Konfiguracja środowiskowa
 
 Plik `appdaemon.yaml` nie jest w repo (konfiguracja środowiskowa). Po instalacji ustaw lokalizację i strefę czasową na wartości ze swojego HA (Settings → System → General):

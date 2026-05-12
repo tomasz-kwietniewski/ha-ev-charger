@@ -35,12 +35,17 @@ EMERGENCY_CURRENT_A = 13   # [A] tryb emergency (~9kW, bufor ~2kW na dom przy 11
 PHASES              = 3
 VOLTAGE             = 230
 
-# --- Progi nadwyżki solarnej ---
-START_SURPLUS_W = 1600   # [W] min nadwyżka do startu (= 6A * 3 * 230V)
+# --- Progi nadwyżki solarnej (z uwzględnieniem SURPLUS_BIAS_W) ---
+START_SURPLUS_W = 1600   # [W] min nadwyżka (po doliczeniu biasu) do startu
 STOP_SURPLUS_W  = 1200   # [W] poniżej - zatrzymaj ładowanie (histereza)
 
+# Bufor zachęcający do startu: doliczany do realnej nadwyżki PCC.
+# Dzięki temu auto startuje już przy ~0.6 kW realnego eksportu (1.6 - 1.0)
+# zamiast czekać na pełne 1.6 kW. Gdy importujemy, surplus_w = SURPLUS_BIAS_W.
+SURPLUS_BIAS_W = 1000
+
 # --- Uśrednianie PCC (wygładzanie migotania) ---
-PCC_HISTORY_SIZE = 2     # ile ostatnich odczytów uśredniać (3 * 30s = 90s)
+PCC_HISTORY_SIZE = 3     # ile ostatnich odczytów uśredniać (3 * 30s = 90s)
 
 # --- Cena energii ---
 NEGATIVE_PRICE_THRESHOLD = 0.0
@@ -195,7 +200,7 @@ class EVChargerControl(hass.Hass):
         soc        = safe_float(SENSOR_SOC)
         pv_power   = safe_float(SENSOR_PV_POWER)
         load_power = safe_float(SENSOR_LOAD_POWER)
-        grid_power = safe_float(SENSOR_GRID_POWER)  # ujemny = eksport, dodatni = import
+        grid_power = safe_float(SENSOR_GRID_POWER)  # dodatni = eksport, ujemny = import
         price      = safe_float(SENSOR_PRICE, default=9.99)
 
         # Uśrednianie PCC — wygładzamy migotanie ±0.x kW przez ostatnie 3 odczyty (90s)
@@ -204,8 +209,12 @@ class EVChargerControl(hass.Hass):
             self._pcc_history.pop(0)
         avg_pcc = sum(self._pcc_history) / len(self._pcc_history)
 
-        # Sofar: ujemny PCC = eksport do sieci = nadwyżka PV
-        surplus_w = (avg_pcc * 1000 + 1000) if avg_pcc > 0 else 1000
+        # Sofar: dodatni PCC = eksport do sieci = nadwyżka PV.
+        # Doliczamy SURPLUS_BIAS_W jako bufor zachęcający do startu (patrz definicja stałej).
+        if avg_pcc > 0:
+            surplus_w = avg_pcc * 1000 + SURPLUS_BIAS_W
+        else:
+            surplus_w = SURPLUS_BIAS_W
 
         return {
             "soc":        soc,

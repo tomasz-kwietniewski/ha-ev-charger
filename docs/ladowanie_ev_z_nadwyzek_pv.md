@@ -150,9 +150,9 @@ W prostszych przypadkach (np. "ładuj zawsze w nocy 23:00–6:00") można ustawi
 
 ---
 
-## Logika sterowania — pięć trybów
+## Logika sterowania — sześć trybów
 
-Skrypt AppDaemon co 30 sekund sprawdza stan instalacji i podejmuje decyzję. W aktualnej wersji obsługuje pięć trybów pracy:
+Skrypt AppDaemon co 30 sekund sprawdza stan instalacji i podejmuje decyzję. W aktualnej wersji obsługuje sześć trybów pracy:
 
 | Tryb                 | Warunek                                     | Działanie                                                  |
 | -------------------- | ------------------------------------------- | ----------------------------------------------------------- |
@@ -379,7 +379,7 @@ else:
     surplus_w = SURPLUS_BIAS_W
 ```
 
-**Logika decyzyjna z pięcioma trybami:**
+**Logika decyzyjna z sześcioma trybami:**
 
 ```python
 def _decide(self, ha_data, charger_data):
@@ -441,7 +441,7 @@ Inteligentne ładowanie auta elektrycznego z nadwyżek PV nie wymaga drogiego sp
 3. Biblioteka TinyTuya do lokalnej kontroli
 4. Trochę Pythona w AppDaemon
 
-System obsługuje pięć trybów pracy: solarny (proporcjonalnie do nadwyżek), awaryjny (ładuj teraz na maksa), ujemne ceny (operator płaci), zimowy (nocna taryfa) i priorytet baterii. Wszystko sterowane z poziomu dashboardu HA.
+System obsługuje sześć trybów pracy: solarny (proporcjonalnie do nadwyżek), awaryjny (ładuj teraz na maksa), ujemne ceny (operator płaci), zimowy (nocna taryfa), priorytet baterii i bezczynność. Wszystko sterowane z poziomu dashboardu HA.
 
 Efekt: auto ładuje się za darmo gdy świeci słońce, a przy ujemnych cenach Pstryk — operator energii dopłaca za to, że pobieramy prąd.
 

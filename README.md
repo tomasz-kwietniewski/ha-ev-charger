@@ -166,7 +166,7 @@ Domyślna konfiguracja AppDaemon może mieć ustawione Amsterdam (`latitude: 52.
 Logi AppDaemon (terminal HA lub SSH):
 
 ```bash
-ha addons logs a0d7b954_appdaemon
+ha apps logs a0d7b954_appdaemon
 ```
 
 > **Uwaga:** AppDaemon loguje przez supervisor HA, **nie** do pliku `.log` na dysku. Komenda powyżej to jedyna pewna droga do logów.

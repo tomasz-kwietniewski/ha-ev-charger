@@ -87,15 +87,15 @@ for f in "${LOCAL_FILES[@]}"; do
 done
 ok "All local files present"
 
-if command -v python3 &>/dev/null; then
+if python3 -c "import sys" &>/dev/null 2>&1; then
     info "Checking syntax: appdaemon/apps/ev_charger.py"
-    if ! python3 -m py_compile appdaemon/apps/ev_charger.py; then
+    if ! python3 -m py_compile appdaemon/apps/ev_charger.py 2>&1; then
         err "Syntax error in ev_charger.py — aborting. Fix before deploying."
         exit 1
     fi
     ok "Syntax OK"
 else
-    info "Warning: python3 not found — syntax check skipped"
+    info "Warning: python3 not available — syntax check skipped"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ done
 step "[5/6] Restarting AppDaemon..."
 # ─────────────────────────────────────────────────────────────────────────────
 
-rc "ha addons restart ${ADDON_SLUG}"
+rc "ha apps restart ${ADDON_SLUG}"
 ok "Restart command sent"
 countdown $RESTART_WAIT "Waiting for AppDaemon"
 
@@ -165,7 +165,7 @@ countdown $RESTART_WAIT "Waiting for AppDaemon"
 step "[6/6] Verifying..."
 # ─────────────────────────────────────────────────────────────────────────────
 
-LOG=$(rc "ha addons logs ${ADDON_SLUG} 2>&1 | tail -80" || true)
+LOG=$(rc "ha apps logs ${ADDON_SLUG} 2>&1 | tail -80" || true)
 
 SUCCESS=false
 HAS_ERROR=false
@@ -185,11 +185,11 @@ do_rollback() {
         rc "cp '${BACKUP_PATH}/${filename}' '${REMOTE_FILES[$i]}' 2>/dev/null || true"
     done
     ok "Files restored"
-    rc "ha addons restart ${ADDON_SLUG}"
+    rc "ha apps restart ${ADDON_SLUG}"
     ok "AppDaemon restarting..."
     countdown $ROLLBACK_WAIT "Waiting"
     printf "\n--- Post-rollback log (last 20 lines) ---\n"
-    rc "ha addons logs ${ADDON_SLUG} 2>&1 | tail -20" || true
+    rc "ha apps logs ${ADDON_SLUG} 2>&1 | tail -20" || true
     printf "─────────────────────────────────────────\n\n"
     printf "${GREEN}${BOLD}  ↩ Rolled back to previous version${NC}\n\n"
 }
@@ -213,7 +213,7 @@ else
         do_rollback
     else
         info "Rollback skipped."
-        info "To check logs: ssh ${SSH_HOST} 'ha addons logs ${ADDON_SLUG} | tail -50'"
+        info "To check logs: ssh ${SSH_HOST} 'ha apps logs ${ADDON_SLUG} | tail -50'"
     fi
 fi
 

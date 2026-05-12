@@ -189,10 +189,10 @@ Sprawdź w Developer Tools wartość tego sensora gdy wiesz że eksportujesz (ba
 
 PCC "migocze" — raz -0,1 kW, raz +0,2 kW, raz -0,5 kW — nawet gdy bilans jest w zasadzie zero. To normalne przy hybrydowym falowniku, regulacja nie jest idealna. Bez filtrowania skrypt zmieniałby prąd ładowania co 30 sekund.
 
-Rozwiązanie: uśrednianie z ostatnich 2 odczytów (60 sekund):
+Rozwiązanie: uśrednianie z ostatnich 3 odczytów (90 sekund):
 
 ```python
-PCC_HISTORY_SIZE = 2
+PCC_HISTORY_SIZE = 3
 
 self._pcc_history.append(grid_power)
 if len(self._pcc_history) > PCC_HISTORY_SIZE:
@@ -202,10 +202,15 @@ avg_pcc = sum(self._pcc_history) / len(self._pcc_history)
 
 ### Bias +1000W — agresywne wykorzystanie nadwyżek
 
-Prąd ładowarki zmienia się skokowo co 690W (1A × 3 fazy × 230V). Żeby skrypt był trochę bardziej "agresywny" i częściej wybierał wyższy prąd, dodałem stały bias +1000W do obliczonej nadwyżki:
+Prąd ładowarki zmienia się skokowo co 690W (1A × 3 fazy × 230V). Żeby skrypt był trochę bardziej "agresywny" i częściej wybierał wyższy prąd, dodałem stały bias +1000W do obliczonej nadwyżki. Dzięki temu auto startuje już przy ~0,6 kW realnego eksportu zamiast czekać na pełne 1,6 kW. W kodzie bias jest wydzielony jako nazwana stała:
 
 ```python
-surplus_w = (avg_pcc * 1000 + 1000) if avg_pcc > 0 else 1000
+SURPLUS_BIAS_W = 1000  # bufor zachęcający do startu
+
+if avg_pcc > 0:
+    surplus_w = avg_pcc * 1000 + SURPLUS_BIAS_W
+else:
+    surplus_w = SURPLUS_BIAS_W
 ```
 
 Przy cenie 0,15 zł/kWh to koszt ~15 groszy za godzinę ładowania w zamian za lepsze wykorzystanie słońca. Latem przy cenach bliskich zeru — bez znaczenia.
@@ -262,7 +267,7 @@ Bez filtrowania migające wartości PCC powodują chaotyczne zmiany prądu co 30
 
 ### Problem 8: Próg startu za wysoki
 
-Pierwotny próg START_SURPLUS_W = 5000W był za wysoki — system nie startował przy nadwyżkach 3–4 kW. Aktualny próg: 1600W (odpowiada dokładnie minimalnemu prądowi 6A × 3 × 230V).
+Pierwotny próg START_SURPLUS_W = 5000W był za wysoki — system nie startował przy nadwyżkach 3–4 kW. Aktualny próg: 1600W (razem z biasem 1000W to znaczy, że auto startuje już przy ~0,6 kW realnego eksportu PCC).
 
 ### Problem 9: Serwery Tuya dla Polski
 
@@ -361,14 +366,17 @@ def _get_charger_data(self):
 
 ```python
 # Sofar: dodatni PCC = eksport (nadwyżka), ujemny = import
-# Uśredniamy ostatnie 2 odczyty żeby wyeliminować migotanie
+# Uśredniamy ostatnie 3 odczyty (90s) żeby wyeliminować migotanie
 self._pcc_history.append(grid_power)
 if len(self._pcc_history) > PCC_HISTORY_SIZE:
     self._pcc_history.pop(0)
 avg_pcc = sum(self._pcc_history) / len(self._pcc_history)
 
 # Bias +1000W — agresywniejsze wykorzystanie nadwyżek
-surplus_w = (avg_pcc * 1000 + 1000) if avg_pcc > 0 else 1000
+if avg_pcc > 0:
+    surplus_w = avg_pcc * 1000 + SURPLUS_BIAS_W
+else:
+    surplus_w = SURPLUS_BIAS_W
 ```
 
 **Logika decyzyjna z pięcioma trybami:**
@@ -441,4 +449,4 @@ Latem planujemy naładować całą baterię 75 kWh praktycznie bez kosztów. Pol
 
 ---
 
-*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W.*
+*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC.*

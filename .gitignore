@@ -10,3 +10,6 @@ ev_charger_data.json
 # Pliki systemowe
 .DS_Store
 Thumbs.db
+
+# Lokalne ustawienia Claude Code (per-maszyna)
+.claude/settings.local.json

@@ -289,6 +289,40 @@ W praktyce wygląda to tak: masz jeden skrypt sterujący ładowarką, a działaj
 
 Rozwiązanie: trzymaj backupy **poza** folderem `apps/`, np. w `addon_configs/a0d7b954_appdaemon/_backups/`.
 
+### Problem 13: STOP-spam w gałęzi IDLE
+
+W `_apply_decision` gałąź `BATTERY_PRIORITY/IDLE/OFFLINE` początkowo nie miała guardu sprawdzającego ostatnio wysłany switch — co iterację (30 s) wysyłała komendę STOP do ładowarki, nawet jeśli już wcześniej została wysłana. Skutek dwojaki: niepotrzebne pakiety przez sieć do wallboxa **oraz** słyszalne klikanie stycznika ładowarki — każdy STOP wymusza cykl przekaźnika.
+
+W logach widać było po kilkanaście STOPów pod rząd w 8 minutach mimo, że stan logiczny się nie zmieniał.
+
+Rozwiązanie: dodać guard `if self._last_sent_switch != False:` analogicznie do gałęzi SOLAR (gdzie analogiczny guard `!= True` już był). Dzięki temu STOP idzie raz na przejście z aktywnego trybu w IDLE, a nie co iterację.
+
+### Problem 14: DP 102 potrafi się „zamrozić" — firmware quirk dé EV v2.9.4
+
+Najbardziej podstępny problem jaki spotkałem. Firmware wallboxa dé EV (sprawdzane na wersji **2.9.4**) potrafi zamrozić cały blok pomiarów w DP 102 — wartości napięć, prądów, mocy, energii sesji i temperatury (`L1`/`L2`/`L3`/`p`/`e`/`t`) zwracają identyczny string przez wiele godzin, mimo że auto fizycznie się ładuje. DP 109 (status) nadal raportuje poprawnie `WORKING`, sterowanie (DP 140 switch, DP 150 current) działa, **tylko pomiary kłamią**.
+
+Diagnoza tego trwała godziny. Wprowadzało w błąd, że Smart Life cyklicznie pokazywało „Charging"/„Paused" — sugerując że to wallbox cyklicznie zatrzymuje sesję. W rzeczywistości auto ładowało stabilnie ~8 kW, tylko nasz skrypt liczył 0 W (a więc też 0 kWh do liczników miesięcznych).
+
+Rozstrzygnięciem był pełny bilans Sofara — porównanie PV, obciążenia, magazynu i PCC — które jednoznacznie pokazało że ~8 kW znika gdzieś (czyli idzie do auta).
+
+**Lekarstwo**: w aplikacji Smart Life otworzyć urządzenie → Settings (zębatka) → **Reboot** (NIE Reset to Factory — to kasuje pairing). Po ~30 sekundach DP 102 wraca do raportowania prawdziwych wartości. Mechanizm — najpewniej zerwany sync wallboxa z chmurą Tuya, soft reboot przywraca.
+
+W skrypcie dodałem **watchdog** który ostrzega w logach (poziom WARNING) gdy w aktywnym trybie ładowania utrzymuje się `status=WORKING + power=0W` przez ponad 10 minut. Próg konfigurowalny przez stałą `WATCHDOG_FROZEN_DP_THRESHOLD`. Skrypt nie restartuje sam — wymagana ręczna interwencja w Smart Life (na razie, do dalszego rozważenia).
+
+### Problem 15: DP 151 — chmura Tuya potrafi wpychać harmonogram
+
+Po reboocie wallboxa zaobserwowałem że DP 151 (harmonogram) zmienił się z pustego `{"m":0,"dt":0,"ss":"00:00","se":"00:00"}` na `{"m":0,"dt":0,"ss":"15:00","se":"17:00"}` — chmura Tuya wpchnęła resztkowy harmonogram. Pole `m:0` oznacza nieaktywny, więc *w tym przypadku* nie blokuje ładowania, ale daje ślad że chmura może modyfikować wallbox lokalnie bez naszego udziału.
+
+W skrypcie dodałem diagnostykę logującą każdą zmianę DP 151 oraz utrzymuję wywołanie `_clear_schedule()` w `initialize()` AppDaemona (raz po starcie skryptu) i w momencie każdego startu sesji. To zabezpiecza przed sytuacją gdy chmura wpchnie tym razem `m:1` (aktywny harmonogram blokujący).
+
+### Problem 16: DP 102 ma ukryte pole `e` — energia sesji × 0,1 kWh
+
+Przy okazji diagnostyki Problemu 14 odkryłem że DP 102 oprócz `L1`/`L2`/`L3`/`p`/`t` zawiera też pole **`e`** — licznik energii bieżącej sesji w jednostce 0,1 kWh. Po `e:5` minęło 0,5 kWh sesji, przy `e:23` mamy 2,3 kWh. Niezależne od naszego liczenia `power_w × dt`, mniej podatne na błędy zaokrąglenia.
+
+Plus pole `d` w DP 102 to **duration sesji** ale w jakichś własnych jednostkach wallboxa (nie sekundach realnych — przyrosty są nieregularne). Pole `t` to **temperatura ładowarki × 10** (`360` = 36,0 °C).
+
+DP 105 z kolei to **historia ostatniej zakończonej sesji** — JSON z polami `t` (timestamp), `s/e` (start/end HH:MM), `d` (duration w sekundach), `c` (kWh × 10). Dostępne natychmiast po zakończeniu sesji — można nasłuchiwać zmian DP 105 i mieć w HA dokładny licznik sesji niezależny od `power × dt`.
+
 ---
 
 ## Helpery w Home Assistant

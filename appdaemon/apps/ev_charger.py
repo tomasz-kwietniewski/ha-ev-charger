@@ -57,6 +57,12 @@ NEGATIVE_PRICE_THRESHOLD = 0.0
 # --- Interwał pętli ---
 UPDATE_INTERVAL_S = 30
 
+# --- Watchdog zamrożonego DP 102 (firmware quirk dé EV v2.9.4) ---
+# Gdy w aktywnym trybie ładowania status=WORKING ale moc=0W przez N
+# iteracji — wallbox prawdopodobnie zamroził pomiar. Lekarstwo:
+# Reboot z aplikacji Smart Life. Watchdog tylko ostrzega w logach.
+WATCHDOG_FROZEN_DP_THRESHOLD = 20  # 20 × 30s = 10 minut
+
 # --- Tryb zimowy ---
 WINTER_MODE_ENTITY  = "input_boolean.ev_tryb_zimowy"
 WINTER_MAX_CURRENT  = 10
@@ -96,12 +102,25 @@ class EVChargerControl(hass.Hass):
         self._last_sent_switch    = None
         self._emergency_end_time  = None
         self._pcc_history         = []
+        # --- DIAG bug 2: śledzenie czy wallbox tkwi w WORKING+0W i czy DP 151 się zmienia ---
+        self._working_zero_power_streak = 0
+        self._last_schedule_seen        = None
 
         self._device = tinytuya.Device(
             DEVICE_ID, DEVICE_IP, DEVICE_KEY, version=PROTOCOL
         )
         self._device.set_socketTimeout(6)
         self._device.set_socketRetryLimit(3)
+
+        # --- DIAG bug 2: jednorazowy dump wszystkich DP na starcie ---
+        # Cel: discovery — może istnieje alternatywne pole z pomiarem mocy
+        # (DP 17 / DP 110 / inne typowe dla mierników Tuya), którego nie używamy.
+        try:
+            init_raw = self._device.status()
+            init_dps = init_raw.get("dps", {})
+            self.log(f"DIAG INIT: pelny DPS = {json.dumps(init_dps, ensure_ascii=False)}")
+        except Exception as e:
+            self.log(f"DIAG INIT: nie udalo sie pobrac pelnego DPS: {e}", level="WARNING")
 
         self._clear_schedule()
         self.listen_state(self._on_emergency_toggle, EMERGENCY_MODE_ENTITY)
@@ -156,8 +175,61 @@ class EVChargerControl(hass.Hass):
         ha_data = self._get_ha_data()
         mode, target_current = self._decide(ha_data, charger_data)
         self._apply_decision(mode, target_current, charger_data)
+        self._update_diag(charger_data, mode)
         self._update_sensors(charger_data, ha_data, mode, target_current)
         self._update_ha_helpers(charger_data, ha_data, mode, target_current)
+
+    # ------------------------------------------------------------------
+    # WATCHDOG / DIAGNOSTYKA
+    # ------------------------------------------------------------------
+
+    def _update_diag(self, charger_data, mode):
+        """Watchdog na zamrożenie pomiaru DP 102 + detekcja zmian DP 151.
+
+        Bug poznawczy z 2026-05-21: firmware dé EV Charger v2.9.4 potrafi
+        "zamrozić" DP 102 (cały blok pomiarów L1/L2/L3/p/e/t) na wiele
+        godzin — wallbox raportuje WORKING + moc 0W mimo realnego ładowania.
+        Soft Reboot z aplikacji Smart Life naprawia. Skrypt nie wykrywa
+        problemu sam, ale ten watchdog ostrzeże w logach gdy WORKING+0W
+        utrzymuje się długo w aktywnym trybie ładowania.
+        """
+        # Streak tylko gdy skrypt świadomie chce ładować (nie liczymy
+        # przerw IDLE/BATTERY_PRIORITY, gdzie 0W jest oczekiwane).
+        active_charging_modes = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
+        in_active_mode = mode in active_charging_modes
+        worker_no_power = (charger_data["status"] in CHARGER_WORKING_STATES
+                           and charger_data["power_w"] == 0)
+
+        if in_active_mode and worker_no_power:
+            self._working_zero_power_streak += 1
+            # Watchdog WARNING — uderza raz, dokładnie przy przekroczeniu progu.
+            if self._working_zero_power_streak == WATCHDOG_FROZEN_DP_THRESHOLD:
+                self.log(
+                    f"WATCHDOG: WORKING+0W w trybie {mode} przez "
+                    f"{WATCHDOG_FROZEN_DP_THRESHOLD * UPDATE_INTERVAL_S}s. "
+                    f"Prawdopodobne zamrożenie DP 102 w wallboxie — "
+                    f"sprobuj Reboot z Smart Life. "
+                    f"DP102_raw={charger_data.get('metrics_raw')!r}",
+                    level="WARNING"
+                )
+        else:
+            if self._working_zero_power_streak >= WATCHDOG_FROZEN_DP_THRESHOLD:
+                self.log(
+                    f"WATCHDOG: koniec WORKING+0W "
+                    f"({self._working_zero_power_streak} iteracji)"
+                )
+            self._working_zero_power_streak = 0
+
+        # DP 151 — historia: chmura Tuya potrafi wpychać harmonogram
+        # (zauważone po reboocie 2026-05-21: pojawił się "ss":"15:00","se":"17:00").
+        # m:0 oznacza nieaktywny harmonogram, więc na razie nie blokuje.
+        # Logujemy każdą zmianę żeby mieć ślad.
+        schedule_now = charger_data.get("schedule")
+        if schedule_now != self._last_schedule_seen:
+            self.log(
+                f"DIAG: DP151 zmiana: {self._last_schedule_seen!r} -> {schedule_now!r}"
+            )
+            self._last_schedule_seen = schedule_now
 
     # ------------------------------------------------------------------
     # ODCZYT DANYCH
@@ -171,6 +243,8 @@ class EVChargerControl(hass.Hass):
             dps     = raw.get("dps", {})
             status  = str(dps.get(str(DP_STATUS), "unknown")).upper()
             current = int(dps.get(str(DP_CURRENT), 0))
+            schedule_raw = dps.get("151", "")               # DIAG bug 2
+            switch_raw   = dps.get(str(DP_SWITCH))          # DIAG bug 2
             metrics_raw = dps.get(str(DP_METRICS), "{}")
             try:
                 metrics = json.loads(metrics_raw) if isinstance(metrics_raw, str) else metrics_raw
@@ -185,13 +259,17 @@ class EVChargerControl(hass.Hass):
             power_w = (p1 + p2 + p3) * 100 if status in CHARGER_WORKING_STATES else 0
             self._device_error_count = 0
             return {"status": status, "current_a": current, "power_w": power_w,
-                    "metrics": metrics, "online": True}
+                    "metrics": metrics, "online": True,
+                    "schedule": schedule_raw, "switch": switch_raw,
+                    "metrics_raw": metrics_raw}
         except Exception as e:
             self._device_error_count += 1
             if self._device_error_count <= 3:
                 self.log(f"Blad polaczenia z ladowarka: {e}", level="WARNING")
             return {"status": "offline", "current_a": 0, "power_w": 0,
-                    "metrics": {}, "online": False}
+                    "metrics": {}, "online": False,
+                    "schedule": None, "switch": None,
+                    "metrics_raw": None}
 
     def _get_ha_data(self):
         def safe_float(entity_id, default=0.0):
@@ -342,8 +420,9 @@ class EVChargerControl(hass.Hass):
 
         elif mode in ("BATTERY_PRIORITY", "IDLE", "OFFLINE"):
             if charger_working:
-                self._set_switch(False)
-                self._last_sent_switch   = False
+                if self._last_sent_switch != False:
+                    self._set_switch(False)
+                    self._last_sent_switch = False
                 self._charger_active     = False
                 self._session_start_time = None
             elif self._charger_active:
@@ -412,9 +491,15 @@ class EVChargerControl(hass.Hass):
     # ------------------------------------------------------------------
 
     def _update_sensors(self, charger_data, ha_data, mode, target_current):
+        # streak pokazujemy dopiero od progu watchdoga (10 min) — pojedyncze
+        # iteracje WORKING+0W są normalne (np. tuż po STOP), nie zaśmiecamy logu
+        streak = self._working_zero_power_streak
+        streak_str = (f", streak0W={streak}({streak * UPDATE_INTERVAL_S}s)"
+                      if streak >= WATCHDOG_FROZEN_DP_THRESHOLD else "")
         self.log(
             f"Sensory: status={charger_data['status']}, moc={charger_data['power_w']:.0f}W, "
             f"tryb={mode}, prad_cel={target_current}A, sesja={self._current_session_kwh:.3f}kWh"
+            f"{streak_str}"
         )
 
     def _update_ha_helpers(self, charger_data, ha_data, mode, target_current):

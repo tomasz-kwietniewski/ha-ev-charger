@@ -17,3 +17,8 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+
+# Manuały sprzętowe — lokalne kopie do podręcznej dokumentacji (copyright vendora,
+# nie publikujemy w publicznym repo). Jeśli kiedyś będziesz chciał zacommitować
+# konkretny PDF (np. własną dokumentację), użyj `git add -f`.
+docs/*.pdf

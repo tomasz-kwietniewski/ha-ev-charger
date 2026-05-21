@@ -106,6 +106,7 @@ START_SURPLUS_W   = 1600 # [W] min nadwyżka do startu (razem z SURPLUS_BIAS_W)
 STOP_SURPLUS_W    = 1200 # [W] poniżej - zatrzymaj ładowanie (histereza)
 SURPLUS_BIAS_W    = 1000 # [W] bufor doliczany do PCC — start już przy ~0,6 kW eksportu
 PCC_HISTORY_SIZE  = 3    # ile odczytów uśredniać (3 * 30s = 90s)
+WATCHDOG_FROZEN_DP_THRESHOLD = 20  # iteracji WORKING+0W zanim watchdog ostrzeże (=10 min)
 ```
 
 ## Struktura plików
@@ -142,6 +143,10 @@ ha-ev-charger/
 - **Znak PCC Sofara** — w tej instalacji dodatni = eksport, ujemny = import; może być odwrotnie — weryfikuj empirycznie po każdej zmianie trybu falownika
 - **Migotanie PCC** — wartość PCC oscyluje ±0,2 kW nawet przy stabilnej pracy; bez uśredniania skrypt niepotrzebnie zmienia prąd co 30 sekund
 - **Moc DP 102 × 100** — wartości mocy per faza są mnożone przez 100, `32` oznacza 3200W
+- **DP 102 potrafi się „zamrozić"** — firmware dé EV Charger v2.9.4 czasami przestaje aktualizować cały blok pomiarów (L1/L2/L3 + pola `p`/`e`/`t`); status nadal `WORKING`, ale moc zwracana to 0 W mimo realnego ładowania. Lekarstwo: **Reboot z aplikacji Smart Life** (Settings → Reboot, nie Reset to Factory). Skrypt ma watchdog ostrzegający w logach po 10 min utrzymującego się WORKING+0W w aktywnym trybie ładowania.
+- **DP 102 ma ukryte pole `e` = energia sesji × 0,1 kWh** — niezależny od naszego liczenia `power × dt`, można użyć jako kontrolny licznik energii sesji
+- **DP 105 = historia ostatniej sesji** — JSON z `t` (timestamp), `s/e` (start/end), `d` (duration), `c` (kWh × 10); aktualizowany przez wallbox po zakończeniu sesji
+- **DP 151 a chmura Tuya** — wallbox po reboocie potrafi pobrać z chmury Tuya niezerowy harmonogram (`m:0` znaczy nieaktywny); skrypt czyści przy starcie sesji, dla bezpieczeństwa też przy każdym `initialize()` AppDaemona
 - **Helpery tylko przez UI** — encje zdefiniowane w YAML są read-only dla serwisów HA
 - **Serwery Tuya dla Polski** — region "Central Europe", serwer Frankfurt AWS (nie Chiny)
 

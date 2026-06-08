@@ -335,7 +335,22 @@ Rozwiązanie ma trzy subtelności warte zapamiętania:
 
 3. **Trwały znacznik miesiąca.** Zamiast `datetime.now().month` w RAM, miesiąc trzymany jest jako `ev_last_ym` (`"YYYY-MM"`) w pliku persistent. Dzięki temu archiwizacja zadziała nawet, gdy serwer był wyłączony 1. dnia miesiąca i wstał np. 2-go.
 
-Co do **publikacji sensora** — tu z rozmysłem łamiemy regułę z Problemu 11. Archiwum (do 120 miesięcy / 10 lat × 7 pól) nie zmieści się w `input_text` (limit 255 znaków), więc pośrednik `input_text` + template sensor odpada. Zamiast tego AppDaemon publikuje `sensor.ev_historia_miesieczna` przez `set_state`, ale **bez** `unit_of_measurement` i `device_class` — to właśnie te dwa atrybuty powodują odrzucenie encji w HA 2026.x, a nie samo `set_state`. Całe archiwum siedzi w atrybucie `months`; jednostki opisują karty dashboardu. Źródłem prawdy pozostaje plik `ev_charger_data.json` (klucz `ev_history`), sensor jest tylko warstwą prezentacji odtwarzaną przy każdym `initialize()`.
+Publikacja sensora to osobny temat — patrz Problem 18.
+
+### Problem 18: `set_state()` na `sensor.*` zwraca 400 w HA 2026.x — publikacja przez REST API
+
+Pierwsza wersja archiwum publikowała `sensor.ev_historia_miesieczna` przez AppDaemon `set_state()`. Na HA **2026.6.1** + AppDaemon **4.5.13** kończyło się to w logach błędem:
+
+```
+ERROR HASS: [400] HTTP POST: Bad Request {'attributes': {'friendly_name': ..., 'months': []}}
+ERROR HASS: Error setting state: Bad Request
+```
+
+To rozwinięcie Problemu 11. Wbrew pierwotnej hipotezie **nie chodzi tylko o `unit_of_measurement`/`device_class`** — `set_state()` na encji `sensor.*` zwraca 400 nawet z gołymi atrybutami. Diagnostyka empiryczna (POST wprost do REST API rdzenia przez proxy supervisora, `http://supervisor/core/api/states/...` z `$SUPERVISOR_TOKEN`) pokazała, że **samo REST API przyjmuje identyczny payload bez zająknięcia (HTTP 201)** — ze stanem `int` i `string`, z `months`, `friendly_name`, `icon`. Wina leży więc po stronie ścieżki `set_state()` w tej wersji AppDaemona, nie HA.
+
+Dlaczego nie `input_text` + template (sprawdzony wzorzec z Problemu 11)? Bo archiwum (do 120 miesięcy / 10 lat × 7 pól) nie zmieści się w `input_text` (limit 255 znaków) ani w stanie encji (też 255). Atrybuty encji limitu nie mają.
+
+Rozwiązanie: `_publish_history()` robi bezpośredni `requests.post(...)` do REST API rdzenia z tokenem z `os.environ["SUPERVISOR_TOKEN"]` (addon ma `homeassistant_api: true`, więc token i proxy są dostępne). Całe archiwum siedzi w atrybucie `months`; stan = kWh ostatniego miesiąca; jednostki opisują karty dashboardu. Źródłem prawdy pozostaje plik `ev_charger_data.json` (klucz `ev_history`) — encja to tylko warstwa prezentacji, odtwarzana przy każdym `initialize()` (czyli też po restarcie HA, gdy AppDaemon przełącza połączenie).
 
 ---
 

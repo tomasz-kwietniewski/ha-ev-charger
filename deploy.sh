@@ -16,7 +16,9 @@ HA_APPS_DIR="/addon_configs/a0d7b954_appdaemon/apps"
 HA_BACKUP_DIR="/addon_configs/a0d7b954_appdaemon/_backups"
 ADDON_SLUG="a0d7b954_appdaemon"
 MAX_BACKUPS=10
-RESTART_WAIT=20
+# 60s, nie 20s — przy restarcie AppDaemon potrafi reinstalować python_packages
+# (tinytuya + cryptography ~40s); za krótkie okno dawało fałszywe "Deploy may have failed".
+RESTART_WAIT=60
 ROLLBACK_WAIT=15
 
 LOCAL_FILES=(

@@ -392,6 +392,28 @@ Słoneczne dni zimą? Skrypt nadal wykrywa nadwyżki PV i uruchamia tryb SOLAR a
 
 ---
 
+## Historia miesięczna — przeglądanie miesiąc do miesiąca
+
+Przez pierwszych kilka tygodni dashboard pokazywał statystyki tylko z bieżącego miesiąca. Mankament: zarówno wewnętrzny licznik energii naładowanej do auta, jak i miesięczne liczniki `utility_meter` w Home Assistant zerują się 1. dnia każdego miesiąca — a stara wartość trafiała wyłącznie do logu i przepadała. Nie dało się cofnąć w czasie i porównać: ile auto wzięło z PV w maju, a ile w czerwcu.
+
+Dorzuciłem więc trwałe **archiwum miesięczne** z retencją **10 lat**. Tuż przed wyzerowaniem licznika skrypt zapisuje zamknięty miesiąc jako jeden rekord:
+
+- energia naładowana do auta [kWh],
+- produkcja PV, zużycie domu, import i eksport z sieci [kWh],
+- samowystarczalność energetyczna domu [%].
+
+Przykładowy wpis za czerwiec 2026: **145,86 kWh** wpompowane w auto przy **62,3%** samowystarczalności. Na dashboardzie wyświetlam to jako wykres słupkowy (miesiąc do miesiąca: auto vs produkcja PV vs zużycie domu) oraz tabelę porównawczą.
+
+Diabeł tkwił w dwóch szczegółach, które warto znać:
+
+**Wyścig z resetem.** Gdyby przy przełomie miesiąca odczytać liczniki „na bieżąco", można trafić już po ich wyzerowaniu i zapisać zera. Dlatego skrypt w każdej iteracji (co 30 s) zapamiętuje snapshot liczników, a przy przełomie archiwizuje snapshot z **poprzedniej** iteracji — czyli stan na koniec starego miesiąca. Niezależnie od tego, w jakiej kolejności HA zresetuje `utility_meter`.
+
+**`set_state()` kontra HA 2026.** Pierwsza wersja publikowała sensor archiwum przez AppDaemonowe `set_state()` — i dostawała `400 Bad Request`. Diagnostyka (strzał wprost do REST API rdzenia przez proxy supervisora) pokazała, że samo API przyjmuje identyczny payload bez zająknięcia — wina leżała po stronie ścieżki `set_state`. Ostatecznie publikuję sensor bezpośrednim `POST`-em do REST API, z całym archiwum w atrybucie `months` (atrybuty nie mają limitu 255 znaków, w przeciwieństwie do `input_text` i stanu encji). Szczegóły w Problemach 17–18 powyżej.
+
+Źródłem prawdy jest plik JSON, który przeżywa restarty — sam sensor to tylko warstwa prezentacji, odtwarzana przy każdym starcie skryptu. Dodałem też opcjonalny przycisk „Zarchiwizuj bieżący miesiąc", który robi snapshot niezamkniętego miesiąca od ręki (bez resetu liczników) — przydatny, gdy nie chce się czekać do 1. dnia, żeby zobaczyć dane.
+
+---
+
 ## Koszt całego rozwiązania
 
 | Element                                         | Koszt               |
@@ -521,4 +543,4 @@ Latem planujemy naładować całą baterię 75 kWh praktycznie bez kosztów. Pol
 
 ---
 
-*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu).*
+*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu). Aktualizacja 4: 8 czerwca 2026 — Problemy 13–16 (STOP-spam w gałęzi IDLE, zamrożony DP 102 w firmware dé EV v2.9.4, chmura Tuya a harmonogram DP 151, ukryte pole `e` = energia sesji × 0,1 kWh); archiwum historii miesięcznej z retencją 10 lat — wykres i tabela porównawcza na dashboardzie, ręczny przycisk archiwizacji (Problemy 17–18: dane ginące przy resecie miesiąca oraz `set_state` 400 w HA 2026.x → publikacja przez REST API rdzenia).*

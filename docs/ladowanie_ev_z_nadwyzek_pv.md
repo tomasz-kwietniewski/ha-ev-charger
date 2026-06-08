@@ -323,6 +323,20 @@ Plus pole `d` w DP 102 to **duration sesji** ale w jakichś własnych jednostkac
 
 DP 105 z kolei to **historia ostatniej zakończonej sesji** — JSON z polami `t` (timestamp), `s/e` (start/end HH:MM), `d` (duration w sekundach), `c` (kWh × 10). Dostępne natychmiast po zakończeniu sesji — można nasłuchiwać zmian DP 105 i mieć w HA dokładny licznik sesji niezależny od `power × dt`.
 
+### Problem 17: Archiwum historii miesięcznej — dane ginęły przy resecie
+
+Licznik `_month_energy_kwh` oraz utility_meters zerują się 1. dnia miesiąca. Stary kod logował tylko `Nowy miesiac! Reset: X kWh` i kasował wartość — historia poprzednich miesięcy przepadała, nie dało się porównać miesiąca do miesiąca.
+
+Rozwiązanie ma trzy subtelności warte zapamiętania:
+
+1. **Wyścig z resetem utility_meter.** Gdyby przy przełomie miesiąca odczytać `sensor.produkcja_pv_miesiac` „na bieżąco", można trafić już po jego wyzerowaniu i zapisać ~0. Dlatego skrypt w każdej iteracji zapamiętuje snapshot liczników (`_um_snapshot`), a przy przełomie archiwizuje snapshot z **poprzedniej** iteracji — czyli stan na koniec starego miesiąca. Niezależnie od kolejności resetów.
+
+2. **Fallback po restarcie.** Jeśli AppDaemon wstanie świeżo (pusty snapshot) tuż po przełomie, sięga po atrybut `last_period` liczników utility_meter — HA trzyma tam wartość poprzedniego cyklu.
+
+3. **Trwały znacznik miesiąca.** Zamiast `datetime.now().month` w RAM, miesiąc trzymany jest jako `ev_last_ym` (`"YYYY-MM"`) w pliku persistent. Dzięki temu archiwizacja zadziała nawet, gdy serwer był wyłączony 1. dnia miesiąca i wstał np. 2-go.
+
+Co do **publikacji sensora** — tu z rozmysłem łamiemy regułę z Problemu 11. Archiwum (do 120 miesięcy / 10 lat × 7 pól) nie zmieści się w `input_text` (limit 255 znaków), więc pośrednik `input_text` + template sensor odpada. Zamiast tego AppDaemon publikuje `sensor.ev_historia_miesieczna` przez `set_state`, ale **bez** `unit_of_measurement` i `device_class` — to właśnie te dwa atrybuty powodują odrzucenie encji w HA 2026.x, a nie samo `set_state`. Całe archiwum siedzi w atrybucie `months`; jednostki opisują karty dashboardu. Źródłem prawdy pozostaje plik `ev_charger_data.json` (klucz `ev_history`), sensor jest tylko warstwą prezentacji odtwarzaną przy każdym `initialize()`.
+
 ---
 
 ## Helpery w Home Assistant

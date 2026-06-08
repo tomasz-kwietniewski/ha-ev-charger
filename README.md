@@ -111,7 +111,7 @@ Utility meters i wewnętrzny licznik energii ładowarki zerują się 1. dnia mie
 
 **Gdzie trzymane są dane:** plik `ev_charger_data.json` w katalogu add-onu AppDaemon, klucz `ev_history` (lista do 120 miesięcy ≈ 10 lat). To samo źródło, co liczniki energii — przeżywa restarty HA.
 
-**Sensor:** AppDaemon publikuje `sensor.ev_historia_miesieczna`. Stan = energia EV ostatniego zarchiwizowanego miesiąca, a atrybut `months` zawiera całe archiwum:
+**Sensor:** AppDaemon publikuje `sensor.ev_historia_miesieczna` bezpośrednim POST-em do REST API rdzenia HA (AppDaemon `set_state` na `sensor.*` zwraca 400 w HA 2026.x — patrz docs, Problem 18). Stan = energia EV ostatniego zarchiwizowanego miesiąca, a atrybut `months` zawiera całe archiwum:
 
 ```json
 {

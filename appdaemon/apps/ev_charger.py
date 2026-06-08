@@ -1,5 +1,6 @@
 import appdaemon.plugins.hass.hassapi as hass
 import tinytuya
+import requests
 import json
 import datetime
 import os
@@ -580,27 +581,47 @@ class EVChargerControl(hass.Hass):
         return out
 
     def _publish_history(self, history=None):
-        """Opublikuj sensor.ev_historia_miesieczna z całym archiwum w atrybutach."""
+        """Opublikuj sensor.ev_historia_miesieczna z całym archiwum w atrybutach.
+
+        UWAGA architektoniczna: AppDaemon `set_state()` na encji `sensor.*` zwraca
+        w HA 2026.x błąd 400 (patrz docs, Problem 11 i 18). Archiwum (do 120 miesięcy
+        / 10 lat) nie zmieści się też w `input_text` (limit 255 znaków). Dlatego
+        publikujemy bezpośrednim POST-em do REST API rdzenia przez proxy supervisora
+        — to przyjmuje pełen payload (zweryfikowane: HTTP 201). Encja jest odtwarzana
+        przy każdym initialize() (czyli też po restarcie HA, gdy AppDaemon się
+        przełącza). Źródłem prawdy pozostaje `ev_history` w pliku persistent.
+        """
         if history is None:
             history = self._load_persistent_raw("ev_history", [])
             if not isinstance(history, list):
                 history = []
         try:
+            token = os.environ.get("SUPERVISOR_TOKEN")
+            if not token:
+                self.log("Brak SUPERVISOR_TOKEN — pomijam publikacje sensora historii",
+                         level="WARNING")
+                return
             last_kwh = history[-1]["ev_kwh"] if history else 0
-            # UWAGA: świadomie BEZ unit_of_measurement i device_class — HA 2026.x
-            # odrzuca encje set_state z tymi atrybutami (patrz docs, Problem 11).
-            # Archiwum (do 120 miesięcy / 10 lat) nie zmieści się w input_text (limit 255 zn.),
-            # więc tu set_state jest właściwą drogą; jednostki opisują karty dashboardu.
-            self.set_state(
-                HISTORY_SENSOR,
-                state=last_kwh,
-                attributes={
-                    "friendly_name": "EV Historia miesięczna",
-                    "icon":          "mdi:chart-bar",
-                    "months":        history,
-                    "months_count":  len(history),
+            resp = requests.post(
+                "http://supervisor/core/api/states/" + HISTORY_SENSOR,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type":  "application/json",
                 },
+                json={
+                    "state": last_kwh,
+                    "attributes": {
+                        "friendly_name": "EV Historia miesięczna",
+                        "icon":          "mdi:chart-bar",
+                        "months":        history,
+                        "months_count":  len(history),
+                    },
+                },
+                timeout=10,
             )
+            if resp.status_code not in (200, 201):
+                self.log(f"Publikacja historii: HTTP {resp.status_code} "
+                         f"{resp.text[:200]}", level="WARNING")
         except Exception as e:
             self.log(f"Blad publikacji historii: {e}", level="WARNING")
 

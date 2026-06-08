@@ -32,6 +32,8 @@ recorder:
       - sensor.sofar_modbus_battery_1_1_soc
       - sensor.ev_energia_miesiac
       - sensor.ev_energia_lacznie
+      - sensor.ev_historia_miesieczna
+
       - sensor.koszt_energii_dzis
       - sensor.realny_koszt_kwh_dzis
       - sensor.miesieczne_saldo_energii

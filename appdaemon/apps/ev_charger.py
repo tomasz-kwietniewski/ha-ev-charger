@@ -1,5 +1,6 @@
 import appdaemon.plugins.hass.hassapi as hass
 import tinytuya
+import requests
 import json
 import datetime
 import os
@@ -80,6 +81,20 @@ SENSOR_LOAD_POWER = "sensor.sofar_modbus_inverter_active_power_load_sys"
 SENSOR_GRID_POWER = "sensor.sofar_modbus_inverter_active_power_pcc_total"
 SENSOR_PRICE      = "sensor.pstryk_energy_pstryk_current_buy_price"
 
+# --- Archiwum historii miesięcznej ---
+# Liczniki utility_meter (zerują się 1. dnia miesiąca). Snapshot ich
+# wartości robimy w każdej iteracji — przy przełomie miesiąca archiwizujemy
+# snapshot z POPRZEDNIEJ iteracji (czyli stan na koniec starego miesiąca),
+# co uniezależnia nas od kolejności resetu utility_meter względem pętli AppDaemon.
+SENSOR_UM_PRODUKCJA = "sensor.produkcja_pv_miesiac"
+SENSOR_UM_ZUZYCIE   = "sensor.zuzycie_domu_miesiac"
+SENSOR_UM_IMPORT    = "sensor.import_z_sieci_miesiac"
+SENSOR_UM_EKSPORT   = "sensor.eksport_do_sieci_miesiac"
+
+# Sensor publikowany przez AppDaemon — atrybut "months" zawiera całe archiwum.
+HISTORY_SENSOR     = "sensor.ev_historia_miesieczna"
+HISTORY_MAX_MONTHS = 120   # ile miesięcy trzymamy (10 lat)
+
 # Stany ładowarki
 CHARGER_READY_STATES   = {"PAUSE", "SLEEP", "IDLE", "UNKNOWN"}
 CHARGER_WORKING_STATES = {"WORKING"}
@@ -93,7 +108,11 @@ class EVChargerControl(hass.Hass):
         self._current_session_kwh = 0.0
         self._month_energy_kwh    = self._load_persistent("ev_month_energy_kwh", 0.0)
         self._total_energy_kwh    = self._load_persistent("ev_total_energy_kwh", 0.0)
-        self._last_month          = datetime.datetime.now().month
+        # Znacznik miesiąca "YYYY-MM" — trwały, by archiwizacja zadziałała nawet
+        # gdy AppDaemon wstanie dopiero po przełomie miesiąca (np. reboot NAS 1.dnia).
+        self._last_ym             = self._load_persistent_raw(
+            "ev_last_ym", datetime.datetime.now().strftime("%Y-%m"))
+        self._um_snapshot         = {}   # ostatnio widziane wartości utility_meter
         self._last_update_time    = None
         self._last_power_w        = 0.0
         self._session_start_time  = None
@@ -105,6 +124,9 @@ class EVChargerControl(hass.Hass):
         # --- DIAG bug 2: śledzenie czy wallbox tkwi w WORKING+0W i czy DP 151 się zmienia ---
         self._working_zero_power_streak = 0
         self._last_schedule_seen        = None
+
+        # Odtwórz sensor historii z trwałego pliku (po restarcie HA/AppDaemon)
+        self._publish_history()
 
         self._device = tinytuya.Device(
             DEVICE_ID, DEVICE_IP, DEVICE_KEY, version=PROTOCOL
@@ -462,10 +484,19 @@ class EVChargerControl(hass.Hass):
 
     def _update_energy_counters(self, charger_data):
         now = datetime.datetime.now()
-        if now.month != self._last_month:
-            self.log(f"Nowy miesiac! Reset: {self._month_energy_kwh:.2f} kWh")
+        current_ym = now.strftime("%Y-%m")
+        if current_ym != self._last_ym:
+            # Przełom miesiąca — zarchiwizuj zamknięty miesiąc PRZED wyzerowaniem.
+            # _um_snapshot wciąż trzyma wartości z poprzedniej iteracji (stary miesiąc).
+            self._archive_month(self._last_ym, self._month_energy_kwh)
+            self.log(
+                f"Nowy miesiac! Reset: {self._month_energy_kwh:.2f} kWh "
+                f"(zarchiwizowano {self._last_ym})"
+            )
             self._month_energy_kwh = 0.0
-            self._last_month = now.month
+            self._last_ym = current_ym
+            self._save_persistent("ev_last_ym", current_ym)
+            self._save_persistent("ev_month_energy_kwh", self._month_energy_kwh)
         if self._last_update_time is not None and charger_data["online"]:
             dt_hours   = (now - self._last_update_time).total_seconds() / 3600.0
             energy_kwh = (charger_data["power_w"] * dt_hours) / 1000.0
@@ -485,6 +516,125 @@ class EVChargerControl(hass.Hass):
                 self._session_start_time = None
         self._last_update_time = now
         self._last_power_w     = charger_data["power_w"]
+        # Zapamiętaj stan liczników miesięcznych — posłuży za snapshot
+        # "koniec miesiąca" przy najbliższym przełomie.
+        self._um_snapshot = self._read_um_snapshot()
+
+    # ------------------------------------------------------------------
+    # ARCHIWUM HISTORII MIESIĘCZNEJ
+    # ------------------------------------------------------------------
+
+    def _archive_month(self, ym, ev_kwh):
+        """Zapisz zamknięty miesiąc do trwałego archiwum i opublikuj sensor."""
+        # Preferuj snapshot z poprzedniej iteracji; po restarcie AppDaemona
+        # snapshot jest pusty — wtedy sięgnij po atrybut last_period utility_meter.
+        snap = self._um_snapshot or self._read_um_last_period()
+        produkcja = snap.get("produkcja")
+        zuzycie   = snap.get("zuzycie")
+        imp       = snap.get("import")
+        eksport   = snap.get("eksport")
+        samowyst  = None
+        if isinstance(zuzycie, (int, float)) and zuzycie > 0 and isinstance(imp, (int, float)):
+            samowyst = round((zuzycie - imp) / zuzycie * 100, 1)
+        record = {
+            "ym":                 ym,
+            "ev_kwh":             round(ev_kwh, 2),
+            "produkcja_kwh":      self._round_or_none(produkcja, 1),
+            "zuzycie_kwh":        self._round_or_none(zuzycie, 1),
+            "import_kwh":         self._round_or_none(imp, 1),
+            "eksport_kwh":        self._round_or_none(eksport, 1),
+            "samowystarczalnosc": samowyst,
+        }
+        history = self._load_persistent_raw("ev_history", [])
+        if not isinstance(history, list):
+            history = []
+        # Idempotencja: nadpisz wpis dla tego miesiąca, gdyby już istniał.
+        history = [h for h in history if h.get("ym") != ym]
+        history.append(record)
+        history.sort(key=lambda h: h.get("ym", ""))
+        history = history[-HISTORY_MAX_MONTHS:]
+        self._save_persistent("ev_history", history)
+        self.log(f"Archiwum miesiaca {ym}: {record}")
+        self._publish_history(history)
+
+    def _read_um_snapshot(self):
+        """Bieżące wartości liczników miesięcznych (stan w trakcie miesiąca)."""
+        return {
+            "produkcja": self._safe_float_state(SENSOR_UM_PRODUKCJA),
+            "zuzycie":   self._safe_float_state(SENSOR_UM_ZUZYCIE),
+            "import":    self._safe_float_state(SENSOR_UM_IMPORT),
+            "eksport":   self._safe_float_state(SENSOR_UM_EKSPORT),
+        }
+
+    def _read_um_last_period(self):
+        """Fallback po restarcie: utility_meter trzyma poprzedni cykl w last_period."""
+        out = {}
+        for key, ent in (("produkcja", SENSOR_UM_PRODUKCJA),
+                         ("zuzycie",   SENSOR_UM_ZUZYCIE),
+                         ("import",    SENSOR_UM_IMPORT),
+                         ("eksport",   SENSOR_UM_EKSPORT)):
+            try:
+                lp = self.get_state(ent, attribute="last_period")
+                out[key] = float(lp) if lp not in (None, "unknown", "unavailable") else None
+            except Exception:
+                out[key] = None
+        return out
+
+    def _publish_history(self, history=None):
+        """Opublikuj sensor.ev_historia_miesieczna z całym archiwum w atrybutach.
+
+        UWAGA architektoniczna: AppDaemon `set_state()` na encji `sensor.*` zwraca
+        w HA 2026.x błąd 400 (patrz docs, Problem 11 i 18). Archiwum (do 120 miesięcy
+        / 10 lat) nie zmieści się też w `input_text` (limit 255 znaków). Dlatego
+        publikujemy bezpośrednim POST-em do REST API rdzenia przez proxy supervisora
+        — to przyjmuje pełen payload (zweryfikowane: HTTP 201). Encja jest odtwarzana
+        przy każdym initialize() (czyli też po restarcie HA, gdy AppDaemon się
+        przełącza). Źródłem prawdy pozostaje `ev_history` w pliku persistent.
+        """
+        if history is None:
+            history = self._load_persistent_raw("ev_history", [])
+            if not isinstance(history, list):
+                history = []
+        try:
+            token = os.environ.get("SUPERVISOR_TOKEN")
+            if not token:
+                self.log("Brak SUPERVISOR_TOKEN — pomijam publikacje sensora historii",
+                         level="WARNING")
+                return
+            last_kwh = history[-1]["ev_kwh"] if history else 0
+            resp = requests.post(
+                "http://supervisor/core/api/states/" + HISTORY_SENSOR,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "state": last_kwh,
+                    "attributes": {
+                        "friendly_name": "EV Historia miesięczna",
+                        "icon":          "mdi:chart-bar",
+                        "months":        history,
+                        "months_count":  len(history),
+                    },
+                },
+                timeout=10,
+            )
+            if resp.status_code not in (200, 201):
+                self.log(f"Publikacja historii: HTTP {resp.status_code} "
+                         f"{resp.text[:200]}", level="WARNING")
+        except Exception as e:
+            self.log(f"Blad publikacji historii: {e}", level="WARNING")
+
+    def _safe_float_state(self, entity):
+        try:
+            v = self.get_state(entity)
+            return float(v) if v not in (None, "unknown", "unavailable") else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _round_or_none(v, n):
+        return round(v, n) if isinstance(v, (int, float)) else None
 
     # ------------------------------------------------------------------
     # AKTUALIZACJA HELPERÓW HA
@@ -558,6 +708,19 @@ class EVChargerControl(hass.Hass):
                 with open(path, "r") as f:
                     data = json.load(f)
                 return float(data.get(key, default))
+            return default
+        except Exception as e:
+            self.log(f"Blad odczytu persistent: {e}", level="WARNING")
+            return default
+
+    def _load_persistent_raw(self, key, default):
+        """Jak _load_persistent, ale bez rzutowania na float — dla stringów/list/dictów."""
+        try:
+            path = "/config/ev_charger_data.json"
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    data = json.load(f)
+                return data.get(key, default)
             return default
         except Exception as e:
             self.log(f"Blad odczytu persistent: {e}", level="WARNING")

@@ -366,6 +366,7 @@ Wymagane helpery — tworzone przez UI (Settings → Helpers):
 | Toggle | `input_boolean.ev_tryb_zimowy`     | Tryb zimowy — nocne ładowanie 22–6      |
 | Toggle | `input_boolean.ev_tryb_awaryjny`   | Tryb awaryjny — ładuj na maksa teraz     |
 | Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (0,5–8h)            |
+| Button | `input_button.ev_archiwizuj_teraz` | Ręczna archiwizacja bieżącego miesiąca (opcjonalny) |
 
 ---
 

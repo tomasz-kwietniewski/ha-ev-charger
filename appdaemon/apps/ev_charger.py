@@ -74,6 +74,12 @@ WINTER_END_HOUR     = 6
 EMERGENCY_MODE_ENTITY  = "input_boolean.ev_tryb_awaryjny"
 EMERGENCY_HOURS_ENTITY = "input_number.ev_awaryjny_godziny"
 
+# --- Ręczna archiwizacja (przycisk testowy/podglądowy) ---
+# Naciśnięcie archiwizuje bieżący miesiąc z aktualnymi danymi, bez resetu
+# liczników. Wpis jest idempotentny po "YYYY-MM" — przy realnym przełomie
+# miesiąca zostanie nadpisany wartością końcową.
+ARCHIVE_NOW_ENTITY = "input_button.ev_archiwizuj_teraz"
+
 # --- Sensory Sofar ---
 SENSOR_SOC        = "sensor.sofar_modbus_battery_1_1_soc"
 SENSOR_PV_POWER   = "sensor.sofar_modbus_inverter_pv_power_total"
@@ -127,6 +133,8 @@ class EVChargerControl(hass.Hass):
 
         # Odtwórz sensor historii z trwałego pliku (po restarcie HA/AppDaemon)
         self._publish_history()
+        # Ręczna archiwizacja na żądanie (przycisk w HA)
+        self.listen_state(self._on_archive_now, ARCHIVE_NOW_ENTITY)
 
         self._device = tinytuya.Device(
             DEVICE_ID, DEVICE_IP, DEVICE_KEY, version=PROTOCOL
@@ -523,6 +531,19 @@ class EVChargerControl(hass.Hass):
     # ------------------------------------------------------------------
     # ARCHIWUM HISTORII MIESIĘCZNEJ
     # ------------------------------------------------------------------
+
+    def _on_archive_now(self, entity, attribute, old, new, kwargs):
+        """Ręczny trigger z przycisku: zarchiwizuj bieżący miesiąc TERAZ.
+
+        Nie resetuje liczników — to tylko snapshot bieżącego (niezamkniętego)
+        miesiąca do podglądu. Czyta świeże wartości utility_meter, więc działa
+        poprawnie niezależnie od momentu w pętli.
+        """
+        ym = datetime.datetime.now().strftime("%Y-%m")
+        self._um_snapshot = self._read_um_snapshot()
+        self.log(f"Reczna archiwizacja biezacego miesiaca {ym} "
+                 f"({self._month_energy_kwh:.2f} kWh)")
+        self._archive_month(ym, self._month_energy_kwh)
 
     def _archive_month(self, ym, ev_kwh):
         """Zapisz zamknięty miesiąc do trwałego archiwum i opublikuj sensor."""

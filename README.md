@@ -78,6 +78,7 @@ Utwórz przez UI (Settings → Helpers) — **nie przez YAML**:
 | Toggle | `input_boolean.ev_tryb_zimowy` | Tryb zimowy (nocne ładowanie 22–6) |
 | Toggle | `input_boolean.ev_tryb_awaryjny` | Tryb awaryjny (ładuj na maksa teraz) |
 | Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (min: 0,5 / max: 8 / step: 0,5 / unit: h) |
+| Button | `input_button.ev_archiwizuj_teraz` | Ręczna archiwizacja bieżącego miesiąca (opcjonalny, do testów/podglądu) |
 
 ### Krok 5 — Template sensory i utility meters
 
@@ -126,6 +127,8 @@ Utility meters i wewnętrzny licznik energii ładowarki zerują się 1. dnia mie
 ```
 
 Wizualizacja (wykres + tabela) — patrz `homeassistant/lovelace_ev_history_card.yaml`.
+
+**Ręczna archiwizacja (opcjonalna):** pierwszy wpis pojawia się dopiero przy najbliższym przełomie miesiąca. Aby zobaczyć/przetestować archiwum od razu, utwórz pomocnik `input_button.ev_archiwizuj_teraz` (przez UI) i dodaj kartę przycisku z `lovelace_ev_history_card.yaml`. Naciśnięcie archiwizuje bieżący (niezamknięty) miesiąc z aktualnymi danymi, bez resetu liczników — wpis jest idempotentny po `YYYY-MM`, więc przy realnym przełomie zostanie nadpisany wartością końcową.
 
 ## Konfiguracja — ważne stałe
 

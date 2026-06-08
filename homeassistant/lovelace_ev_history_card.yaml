@@ -1,0 +1,73 @@
+# Karty dashboardu — archiwum historii miesięcznej ładowarki EV
+# ============================================================
+# Źródłem danych jest sensor.ev_historia_miesieczna publikowany przez AppDaemon.
+# Jego atrybut `months` to lista wpisów (najstarszy → najnowszy):
+#   { ym, ev_kwh, produkcja_kwh, zuzycie_kwh, import_kwh, eksport_kwh, samowystarczalnosc }
+#
+# Plik to LISTA dwóch kart — wklej całość pod `cards:` w widoku dashboardu
+# (tryb YAML), albo każdy element listy osobno przez "Add Card → Manual".
+
+# ------------------------------------------------------------
+# 1) Wykres słupkowy — miesiąc do miesiąca (wymaga HACS: apexcharts-card)
+#    Porównuje energię naładowaną do auta z produkcją PV i zużyciem domu.
+# ------------------------------------------------------------
+- type: custom:apexcharts-card
+  header:
+    show: true
+    title: Energia miesiąc do miesiąca
+    show_states: false
+  graph_span: 10y
+  span:
+    end: month
+  yaxis:
+    - id: kwh
+      decimals: 0
+      apex_config:
+        title:
+          text: kWh
+  series:
+    - entity: sensor.ev_historia_miesieczna
+      name: Naładowano do auta
+      type: column
+      yaxis_id: kwh
+      data_generator: |
+        return (entity.attributes.months || []).map(m => {
+          return [new Date(m.ym + "-15T12:00:00").getTime(), m.ev_kwh];
+        });
+    - entity: sensor.ev_historia_miesieczna
+      name: Produkcja PV
+      type: column
+      yaxis_id: kwh
+      data_generator: |
+        return (entity.attributes.months || []).map(m => {
+          return [new Date(m.ym + "-15T12:00:00").getTime(), m.produkcja_kwh];
+        });
+    - entity: sensor.ev_historia_miesieczna
+      name: Zużycie domu
+      type: column
+      yaxis_id: kwh
+      data_generator: |
+        return (entity.attributes.months || []).map(m => {
+          return [new Date(m.ym + "-15T12:00:00").getTime(), m.zuzycie_kwh];
+        });
+
+# ------------------------------------------------------------
+# 2) Tabela porównawcza — natywna karta Markdown (bez HACS).
+#    Najnowsze miesiące na górze.
+# ------------------------------------------------------------
+- type: markdown
+  title: Historia miesięczna
+  content: >
+    | Miesiąc | EV [kWh] | PV [kWh] | Dom [kWh] | Import | Eksport | Samowyst. |
+
+    |:--------|--------:|--------:|---------:|-------:|--------:|----------:|
+
+    {% for m in (state_attr('sensor.ev_historia_miesieczna', 'months') or [])
+       | reverse -%}
+    | {{ m.ym }} | {{ m.ev_kwh }} | {{ m.produkcja_kwh if m.produkcja_kwh is not
+    none else '—' }} | {{ m.zuzycie_kwh if m.zuzycie_kwh is not none else '—' }} |
+    {{ m.import_kwh if m.import_kwh is not none else '—' }} | {{ m.eksport_kwh if
+    m.eksport_kwh is not none else '—' }} | {{ (m.samowystarczalnosc ~ '%') if
+    m.samowystarczalnosc is not none else '—' }} |
+
+    {% endfor %}

@@ -90,9 +90,42 @@ Tworzone są m.in.:
 - `sensor.samowystarczalnosc_miesiac` — samowystarczalność energetyczna miesiąc [%]
 - utility meters miesięczne: zużycie domu, produkcja PV, import, eksport
 
+> Sensor `sensor.ev_historia_miesieczna` (archiwum miesiąc do miesiąca) jest publikowany przez AppDaemon, nie definiujesz go w YAML. Patrz sekcja [Historia miesięczna](#historia-miesiczna).
+
 ### Krok 6 — Dashboard
 
 Dodaj kartę z `homeassistant/lovelace_ev_card.yaml` do swojego dashboardu. Zawiera panel sterowania trybem awaryjnym, status ładowania i statystyki energii.
+
+Dla archiwum miesiąc do miesiąca dołóż karty z `homeassistant/lovelace_ev_history_card.yaml` (wykres słupkowy + tabela). Wykres słupkowy wymaga karty `apexcharts-card` z HACS; tabela Markdown działa natywnie, bez HACS.
+
+## Historia miesięczna
+
+Utility meters i wewnętrzny licznik energii ładowarki zerują się 1. dnia miesiąca — bez archiwizacji dane poprzedniego miesiąca przepadały (trafiały tylko do logu). Skrypt zapisuje teraz zamknięty miesiąc do trwałego archiwum, dzięki czemu można cofać się w czasie i porównywać miesiąc do miesiąca.
+
+**Jak to działa:**
+
+- W każdej iteracji (co 30 s) skrypt zapamiętuje bieżące wartości liczników miesięcznych (`_um_snapshot`).
+- Przy przełomie miesiąca — **zanim** wyzeruje licznik — archiwizuje snapshot z poprzedniej iteracji (stan na koniec starego miesiąca). Dzięki temu wynik nie zależy od tego, czy utility_meter zdążył się już zresetować.
+- Po restarcie AppDaemona (pusty snapshot) używany jest fallback: atrybut `last_period` liczników utility_meter.
+- Znacznik miesiąca (`ev_last_ym`) jest trwały, więc archiwizacja zadziała nawet, gdy serwer wstanie dopiero po 1. dniu miesiąca.
+
+**Gdzie trzymane są dane:** plik `ev_charger_data.json` w katalogu add-onu AppDaemon, klucz `ev_history` (lista do 120 miesięcy ≈ 10 lat). To samo źródło, co liczniki energii — przeżywa restarty HA.
+
+**Sensor:** AppDaemon publikuje `sensor.ev_historia_miesieczna` bezpośrednim POST-em do REST API rdzenia HA (AppDaemon `set_state` na `sensor.*` zwraca 400 w HA 2026.x — patrz docs, Problem 18). Stan = energia EV ostatniego zarchiwizowanego miesiąca, a atrybut `months` zawiera całe archiwum:
+
+```json
+{
+  "ym": "2026-05",
+  "ev_kwh": 142.6,
+  "produkcja_kwh": 890.3,
+  "zuzycie_kwh": 612.1,
+  "import_kwh": 78.4,
+  "eksport_kwh": 410.2,
+  "samowystarczalnosc": 87.2
+}
+```
+
+Wizualizacja (wykres + tabela) — patrz `homeassistant/lovelace_ev_history_card.yaml`.
 
 ## Konfiguracja — ważne stałe
 
@@ -120,7 +153,8 @@ ha-ev-charger/
 │   └── apps.yaml                      ← rejestr aplikacji AppDaemon
 ├── homeassistant/
 │   ├── configuration.yaml             ← template sensory + utility meters
-│   └── lovelace_ev_card.yaml          ← karta dashboardu z trybem awaryjnym
+│   ├── lovelace_ev_card.yaml          ← karta dashboardu z trybem awaryjnym
+│   └── lovelace_ev_history_card.yaml  ← karty archiwum (wykres + tabela)
 ├── ev_charger_secrets.json.example    ← szablon danych urządzenia
 └── docs/
     └── ladowanie_ev_z_nadwyzek_pv.md  ← artykuł techniczny

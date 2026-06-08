@@ -71,3 +71,17 @@
     m.samowystarczalnosc is not none else '—' }} |
 
     {% endfor %}
+
+# ------------------------------------------------------------
+# 3) Przycisk ręcznej archiwizacji (opcjonalny — do testów/podglądu).
+#    Archiwizuje bieżący (niezamknięty) miesiąc bez resetu liczników.
+#    Wymaga pomocnika input_button.ev_archiwizuj_teraz (utwórz przez UI).
+# ------------------------------------------------------------
+- type: button
+  name: Zarchiwizuj bieżący miesiąc
+  icon: mdi:content-save-cog
+  tap_action:
+    action: perform-action
+    perform_action: input_button.press
+    target:
+      entity_id: input_button.ev_archiwizuj_teraz

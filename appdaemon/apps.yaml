@@ -1,7 +1,3 @@
-hello_world:
-  module: hello
-  class: HelloWorld
-
 ev_charger_control:
   module: ev_charger
   class: EVChargerControl

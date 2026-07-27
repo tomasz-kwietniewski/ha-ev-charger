@@ -33,6 +33,9 @@ recorder:
       - sensor.ev_energia_miesiac
       - sensor.ev_energia_lacznie
       - sensor.ev_historia_miesieczna
+      - sensor.ev_moc_ladowania
+      - sensor.ev_prad_ladowania
+      - sensor.ev_energia_sesja
 
       - sensor.koszt_energii_dzis
       - sensor.realny_koszt_kwh_dzis
@@ -160,35 +163,47 @@ template:
           {% else %}mdi:car-electric
           {% endif %}
 
+      # Guard: po restarcie HA input_text.ev_data bywa puste/unknown zanim
+      # AppDaemon zdąży je zapisać — from_json na takim stanie wywala template.
       - name: "EV Moc Ladowania"
         unique_id: ev_moc_ladowania
-        state: "{{ ((states('input_text.ev_data') | from_json).power | default(0) | float / 1000) | round(2) }}"
+        state: >
+          {% set d = states('input_text.ev_data') %}
+          {% if d and d.startswith('{') %}{{ (((d | from_json).power | default(0)) | float / 1000) | round(2) }}{% else %}0{% endif %}
         unit_of_measurement: "kW"
         icon: mdi:lightning-bolt
 
       - name: "EV Prad Ladowania"
         unique_id: ev_prad_ladowania
-        state: "{{ (states('input_text.ev_data') | from_json).current | default(0) }}"
+        state: >
+          {% set d = states('input_text.ev_data') %}
+          {% if d and d.startswith('{') %}{{ (d | from_json).current | default(0) }}{% else %}0{% endif %}
         unit_of_measurement: "A"
         icon: mdi:current-ac
 
       - name: "EV Energia Sesja"
         unique_id: ev_energia_sesja
-        state: "{{ (states('input_text.ev_data') | from_json).session | default(0) }}"
+        state: >
+          {% set d = states('input_text.ev_data') %}
+          {% if d and d.startswith('{') %}{{ (d | from_json).session | default(0) }}{% else %}0{% endif %}
         unit_of_measurement: "kWh"
         device_class: energy
         icon: mdi:battery-charging-outline
 
       - name: "EV Energia Miesiac"
         unique_id: ev_energia_miesiac
-        state: "{{ (states('input_text.ev_data') | from_json).month | default(0) }}"
+        state: >
+          {% set d = states('input_text.ev_data') %}
+          {% if d and d.startswith('{') %}{{ (d | from_json).month | default(0) }}{% else %}0{% endif %}
         unit_of_measurement: "kWh"
         device_class: energy
         icon: mdi:calendar-month
 
       - name: "EV Energia Lacznie"
         unique_id: ev_energia_lacznie
-        state: "{{ (states('input_text.ev_data') | from_json).total | default(0) }}"
+        state: >
+          {% set d = states('input_text.ev_data') %}
+          {% if d and d.startswith('{') %}{{ (d | from_json).total | default(0) }}{% else %}0{% endif %}
         unit_of_measurement: "kWh"
         device_class: energy
         icon: mdi:counter

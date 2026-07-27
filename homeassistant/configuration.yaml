@@ -36,7 +36,6 @@ recorder:
       - sensor.ev_moc_ladowania
       - sensor.ev_prad_ladowania
       - sensor.ev_energia_sesja
-
       - sensor.koszt_energii_dzis
       - sensor.realny_koszt_kwh_dzis
       - sensor.miesieczne_saldo_energii
@@ -56,47 +55,10 @@ sensor:
       - pct
       - lstRead
       - bat
-  - platform: template
-    sensors:
-      lvl:
-        friendly_name: "Poziom"
-        value_template: "{{ state_attr('sensor.szambo', 'lvl') | float(0) }}"
-        unit_of_measurement: "cm"
-        device_class: "distance"
-      pct:
-        friendly_name: "Procent"
-        value_template: "{{ state_attr('sensor.szambo', 'pct') | float(0) }}"
-        unit_of_measurement: "%"
-      bat:
-        friendly_name: "Bateria"
-        value_template: "{{ state_attr('sensor.szambo', 'bat') | float(0) }}"
-        unit_of_measurement: "%"
-        device_class: "battery"
-      lstread:
-        friendly_name: "Ostatni odczyt (czytelny)"
-        value_template: >-
-          {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
-          {% set t = as_timestamp(t_string) %}
-          {{ t | timestamp_custom('%d %b %H:%M') if t is number else '—' }}
-      lstread_ts:
-        friendly_name: "Ostatni odczyt"
-        value_template: "{{ state_attr('sensor.szambo', 'lstRead') }}"
-        device_class: timestamp
-      mininterval:
-        friendly_name: "Minuty od odczytu"
-        unit_of_measurement: "min"
-        value_template: >-
-          {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
-          {% set t = as_timestamp(t_string) %}
-          {% if t is number %}
-            {{ ((now().timestamp() - t) / 60) | round(0) }}
-          {% else %}
-            unknown
-          {% endif %}
 
 logger:
   default: warning
-  logs:
+  # logs:
     # custom_components.localtuya: debug
 
 # Utility meter — miesięczne liczniki z Sofara
@@ -120,6 +82,50 @@ utility_meter:
     cycle: monthly
 
 template:
+  # Sensory szamba (zmigrowane ze starego formatu sensor: platform: template)
+  # default_entity_id zachowuje oryginalne entity_id, by nie psuć dashboardu
+  - sensor:
+      - name: "Poziom"
+        default_entity_id: sensor.lvl
+        state: "{{ state_attr('sensor.szambo', 'lvl') | float(0) }}"
+        unit_of_measurement: "cm"
+        device_class: distance
+
+      - name: "Procent"
+        default_entity_id: sensor.pct
+        state: "{{ state_attr('sensor.szambo', 'pct') | float(0) }}"
+        unit_of_measurement: "%"
+
+      - name: "Bateria"
+        default_entity_id: sensor.bat
+        state: "{{ state_attr('sensor.szambo', 'bat') | float(0) }}"
+        unit_of_measurement: "%"
+        device_class: battery
+
+      - name: "Ostatni odczyt (czytelny)"
+        default_entity_id: sensor.lstread
+        state: >-
+          {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
+          {% set t = as_timestamp(t_string) %}
+          {{ t | timestamp_custom('%d %b %H:%M') if t is number else '—' }}
+
+      - name: "Ostatni odczyt"
+        default_entity_id: sensor.lstread_ts
+        state: "{{ state_attr('sensor.szambo', 'lstRead') }}"
+        device_class: timestamp
+
+      - name: "Minuty od odczytu"
+        default_entity_id: sensor.mininterval
+        unit_of_measurement: "min"
+        state: >-
+          {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
+          {% set t = as_timestamp(t_string) %}
+          {% if t is number %}
+            {{ ((now().timestamp() - t) / 60) | round(0) }}
+          {% else %}
+            unknown
+          {% endif %}
+
   - sensor:
       - name: "EV Status Opis"
         unique_id: ev_status_opis
@@ -164,7 +170,7 @@ template:
           {% endif %}
 
       # Guard: po restarcie HA input_text.ev_data bywa puste/unknown zanim
-      # AppDaemon zdąży je zapisać — from_json na takim stanie wywala template.
+      # AppDaemon zdazy je zapisac - from_json na takim stanie wywala template.
       - name: "EV Moc Ladowania"
         unique_id: ev_moc_ladowania
         state: >

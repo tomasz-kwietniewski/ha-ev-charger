@@ -38,8 +38,9 @@ DRY_RUN=false
 
 for arg in "$@"; do
     case "$arg" in
-        --force)    FORCE=true ;;
-        --dry-run)  DRY_RUN=true ;;
+        --force)            FORCE=true ;;
+        --dry-run)          DRY_RUN=true ;;
+        --force-no-python)  ;;   # obsługiwane w kroku [1/6]
         *) printf "${RED}Unknown argument: %s${NC}\n" "$arg" >&2; exit 1 ;;
     esac
 done
@@ -89,15 +90,41 @@ for f in "${LOCAL_FILES[@]}"; do
 done
 ok "All local files present"
 
-if python3 -c "import sys" &>/dev/null 2>&1; then
-    info "Checking syntax: appdaemon/apps/ev_charger.py"
-    if ! python3 -m py_compile appdaemon/apps/ev_charger.py 2>&1; then
+# Znajdź działający interpreter. UWAGA: na Windowsie `python3` bywa zaślepką
+# ze Sklepu Microsoft — istnieje w PATH, ale kończy się błędem. Dlatego
+# sprawdzamy przez faktyczne uruchomienie, nie przez `command -v`.
+PYTHON=""
+for candidate in python3 python py; do
+    if "$candidate" -c "import sys" >/dev/null 2>&1; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+
+if [[ -n "$PYTHON" ]]; then
+    info "Checking syntax: appdaemon/apps/ev_charger.py (${PYTHON})"
+    if ! "$PYTHON" -m py_compile appdaemon/apps/ev_charger.py 2>&1; then
         err "Syntax error in ev_charger.py — aborting. Fix before deploying."
         exit 1
     fi
     ok "Syntax OK"
+
+    if [[ -f tests/test_ev_charger.py ]]; then
+        info "Running unit tests: tests/test_ev_charger.py"
+        if ! TEST_OUT=$("$PYTHON" tests/test_ev_charger.py 2>&1); then
+            err "Tests failed — aborting. Fix before deploying."
+            echo "$TEST_OUT" | grep -E "FAIL|ERROR" || echo "$TEST_OUT" | tail -20
+            exit 1
+        fi
+        ok "$(echo "$TEST_OUT" | tail -1)"
+    fi
 else
-    info "Warning: python3 not available — syntax check skipped"
+    err "No working Python interpreter found (tried python3/python/py)."
+    err "Syntax check and tests would be skipped — aborting to avoid a blind deploy."
+    err "Use --force-no-python to deploy anyway."
+    for arg in "$@"; do [[ "$arg" == "--force-no-python" ]] && PYTHON="skip"; done
+    [[ "$PYTHON" == "skip" ]] || exit 1
+    info "Skipping syntax check and tests (--force-no-python)"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,7 +248,8 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage:
-#   ./deploy.sh            # normal deploy with confirmation
-#   ./deploy.sh --force    # skip confirmation prompt (CI-friendly)
-#   ./deploy.sh --dry-run  # show plan without making any changes
+#   ./deploy.sh                   # normal deploy with confirmation
+#   ./deploy.sh --force           # skip confirmation prompt (CI-friendly)
+#   ./deploy.sh --dry-run         # show plan without making any changes
+#   ./deploy.sh --force-no-python # deploy without syntax check and tests (last resort)
 # ─────────────────────────────────────────────────────────────────────────────

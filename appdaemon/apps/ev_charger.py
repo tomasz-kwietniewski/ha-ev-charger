@@ -10,7 +10,10 @@ import os
 # mapuje się na katalog add-onu (/addon_configs/a0d7b954_appdaemon/),
 # NIE na główny katalog HA (/config/). Aktywny plik sekretów to:
 #   /addon_configs/a0d7b954_appdaemon/ev_charger_secrets.json
-_SECRETS_PATH = "/config/ev_charger_secrets.json"
+# Zmienne środowiskowe EV_SECRETS_PATH / EV_DATA_PATH pozwalają podmienić
+# ścieżki w testach jednostkowych (patrz tests/).
+_SECRETS_PATH = os.environ.get("EV_SECRETS_PATH", "/config/ev_charger_secrets.json")
+_PERSIST_PATH = os.environ.get("EV_DATA_PATH", "/config/ev_charger_data.json")
 try:
     with open(_SECRETS_PATH) as _f:
         _secrets = json.load(_f)
@@ -37,6 +40,8 @@ SOC_EMERGENCY_MIN = 20   # [%] w trybie EMERGENCY zatrzymaj gdy SOC spadnie poni
 MIN_CURRENT_A       = 6    # [A] minimum wymagane przez ładowarkę
 MAX_CURRENT_A       = 16   # [A] maksimum ładowarki
 EMERGENCY_CURRENT_A = 13   # [A] tryb emergency (~9kW, bufor ~2kW na dom przy 11kW przyłączu)
+# Ujemna cena: też zostaw bufor na dom — 16A = 11kW zjadłoby całe przyłącze.
+NEGATIVE_PRICE_CURRENT_A = 13
 PHASES              = 3
 VOLTAGE             = 230
 
@@ -44,13 +49,23 @@ VOLTAGE             = 230
 START_SURPLUS_W = 1600   # [W] min nadwyżka (po doliczeniu biasu) do startu
 STOP_SURPLUS_W  = 1200   # [W] poniżej - zatrzymaj ładowanie (histereza)
 
-# Bufor zachęcający do startu: doliczany do realnej nadwyżki PCC.
+# Bufor zachęcający do startu: doliczany do realnej nadwyżki.
 # Dzięki temu auto startuje już przy ~0.6 kW realnego eksportu (1.6 - 1.0)
-# zamiast czekać na pełne 1.6 kW. Gdy importujemy, surplus_w = SURPLUS_BIAS_W.
+# zamiast czekać na pełne 1.6 kW. Przy imporcie surplus_w jest UJEMNY
+# (plus bias) — bez floora, żeby regulacja widziała wielkość deficytu.
 SURPLUS_BIAS_W = 1000
 
-# --- Uśrednianie PCC (wygładzanie migotania) ---
+# --- Uśrednianie nadwyżki (wygładzanie migotania PCC) ---
 PCC_HISTORY_SIZE = 3     # ile ostatnich odczytów uśredniać (3 * 30s = 90s)
+
+# --- Ponowienia komendy switch (START/STOP) ---
+# Dedup po _last_sent_switch chroni przed spamem (Problem 13), ale bez
+# ponowień jedna zgubiona/nieskuteczna komenda blokowała sterowanie na stałe.
+SWITCH_RETRY_ITERATIONS  = 4   # co ile iteracji ponawiać przy niezgodności (4 x 30s = 2 min)
+SWITCH_MAX_START_RETRIES = 3   # ile razy ponawiać START zanim odpuścimy (auto może być pełne)
+# STOP ponawiamy dłużej (ochrona magazynu), ale też z limitem — każdy STOP to
+# cykl stycznika wallboxa, a wieczne klikanie było oryginalnym Problemem 13.
+SWITCH_MAX_STOP_RETRIES  = 5   # 5 x 2 min = 10 minut prób, potem głośny ERROR
 
 # --- Cena energii ---
 NEGATIVE_PRICE_THRESHOLD = 0.0
@@ -63,6 +78,12 @@ UPDATE_INTERVAL_S = 30
 # iteracji — wallbox prawdopodobnie zamroził pomiar. Lekarstwo:
 # Reboot z aplikacji Smart Life. Watchdog tylko ostrzega w logach.
 WATCHDOG_FROZEN_DP_THRESHOLD = 20  # 20 × 30s = 10 minut
+# Po ilu iteracjach WORKING+0W przestajemy wierzyć w zero i do obliczenia
+# nadwyżki podstawiamy ostatnią znaną moc. Bez tego zamrożony pomiar wygląda
+# jak wielki deficyt i skrypt STOPuje realnie trwającą sesję (zamiast dać
+# watchdogowi dojść do progu i ostrzec). 2 iteracje = 1 min, czyli więcej niż
+# normalna chwila negocjacji auto-wallbox tuż po starcie.
+FROZEN_DP_FALLBACK_ITERS = 2
 
 # --- Tryb zimowy ---
 WINTER_MODE_ENTITY  = "input_boolean.ev_tryb_zimowy"
@@ -121,12 +142,16 @@ class EVChargerControl(hass.Hass):
         self._um_snapshot         = {}   # ostatnio widziane wartości utility_meter
         self._last_update_time    = None
         self._last_power_w        = 0.0
+        self._last_nonzero_power_w = 0.0   # do kompensacji przy zamrożonym DP 102
         self._session_start_time  = None
         self._device_error_count  = 0
         self._last_sent_current   = -1
         self._last_sent_switch    = None
+        self._switch_mismatch_iters = 0   # iteracje niezgodności stan vs wysłana komenda
+        self._start_retries         = 0   # ile razy ponowiono START w bieżącym podejściu
+        self._stop_retries          = 0   # jw. dla STOP
         self._emergency_end_time  = None
-        self._pcc_history         = []
+        self._surplus_history         = []
         # --- DIAG bug 2: śledzenie czy wallbox tkwi w WORKING+0W i czy DP 151 się zmienia ---
         self._working_zero_power_streak = 0
         self._last_schedule_seen        = None
@@ -140,7 +165,9 @@ class EVChargerControl(hass.Hass):
             DEVICE_ID, DEVICE_IP, DEVICE_KEY, version=PROTOCOL
         )
         self._device.set_socketTimeout(6)
-        self._device.set_socketRetryLimit(3)
+        # 1 retry, nie 3 — pętla i tak ponawia co 30 s, a 3 retry x 6 s timeout
+        # (plus drugi odczyt) potrafiły blokować wątek dłużej niż interwał pętli.
+        self._device.set_socketRetryLimit(1)
 
         # --- DIAG bug 2: jednorazowy dump wszystkich DP na starcie ---
         # Cel: discovery — może istnieje alternatywne pole z pomiarem mocy
@@ -202,7 +229,7 @@ class EVChargerControl(hass.Hass):
     def _main_loop(self, kwargs):
         charger_data = self._get_charger_data()
         self._update_energy_counters(charger_data)
-        ha_data = self._get_ha_data()
+        ha_data = self._get_ha_data(charger_data)
         mode, target_current = self._decide(ha_data, charger_data)
         self._apply_decision(mode, target_current, charger_data)
         self._update_diag(charger_data, mode)
@@ -268,8 +295,14 @@ class EVChargerControl(hass.Hass):
     def _get_charger_data(self):
         try:
             raw = self._device.status()
-            if not raw.get('dps', {}).get('109'):
+            # tinytuya przy problemach sieciowych często NIE rzuca wyjątku,
+            # tylko zwraca dict {"Error": ..., "Err": "9xx"} — bez tej detekcji
+            # pusty dps dawał status "UNKNOWN", traktowany jako "gotowy do ładowania".
+            if (not isinstance(raw, dict) or "Error" in raw
+                    or not raw.get("dps", {}).get(str(DP_STATUS))):
                 raw = self._device.status()
+            if not isinstance(raw, dict) or "Error" in raw:
+                raise RuntimeError(f"tinytuya zwrocil blad: {raw!r}")
             dps     = raw.get("dps", {})
             status  = str(dps.get(str(DP_STATUS), "unknown")).upper()
             current = int(dps.get(str(DP_CURRENT), 0))
@@ -301,7 +334,7 @@ class EVChargerControl(hass.Hass):
                     "schedule": None, "switch": None,
                     "metrics_raw": None}
 
-    def _get_ha_data(self):
+    def _get_ha_data(self, charger_data):
         def safe_float(entity_id, default=0.0):
             try:
                 val = self.get_state(entity_id)
@@ -315,27 +348,48 @@ class EVChargerControl(hass.Hass):
         grid_power = safe_float(SENSOR_GRID_POWER)  # dodatni = eksport, ujemny = import
         price      = safe_float(SENSOR_PRICE, default=9.99)
 
-        # Uśrednianie PCC — wygładzamy migotanie ±0.x kW przez ostatnie 3 odczyty (90s)
-        self._pcc_history.append(grid_power)
-        if len(self._pcc_history) > PCC_HISTORY_SIZE:
-            self._pcc_history.pop(0)
-        avg_pcc = sum(self._pcc_history) / len(self._pcc_history)
+        # Nadwyżka bez auta [kW] = min(eksport PCC, PV - dom).
+        # Sofar: dodatni PCC = eksport do sieci, ujemny = import.
+        # Samo PCC nie wystarcza: falownik w trybie self-use trzyma PCC~0
+        # rozładowując magazyn — deficyt byłby niewidoczny i regulacja
+        # podkręcałaby prąd kosztem baterii. PV-dom widzi ten deficyt
+        # (wychodzi ujemne), a przy pełnej baterii jest równe PCC.
+        # min() bierze wariant konserwatywny: nadwyżka dostępna bez ruszania magazynu.
+        surplus_without_ev_kw = min(grid_power, pv_power - load_power)
 
-        # Sofar: dodatni PCC = eksport do sieci = nadwyżka PV.
-        # Doliczamy SURPLUS_BIAS_W jako bufor zachęcający do startu (patrz definicja stałej).
-        if avg_pcc > 0:
-            surplus_w = avg_pcc * 1000 + SURPLUS_BIAS_W
-        else:
-            surplus_w = SURPLUS_BIAS_W
+        # Pobór ładowarki siedzi już w load_power — doliczamy go z powrotem,
+        # żeby dostać "ile w ogóle jest do dyspozycji dla auta".
+        # KOLEJNOŚĆ MA ZNACZENIE: kompensacja PRZED uśrednianiem. Odwrotnie
+        # (średnia z próbek mierzonych przy różnej mocy ładowania + bieżąca moc)
+        # daje przeszacowanie i skok prądu tuż po starcie sesji.
+        available_kw = surplus_without_ev_kw
+        if charger_data["status"] in CHARGER_WORKING_STATES:
+            power_w = charger_data["power_w"]
+            if (power_w == 0
+                    and self._working_zero_power_streak >= FROZEN_DP_FALLBACK_ITERS
+                    and self._last_nonzero_power_w > 0):
+                power_w = self._last_nonzero_power_w
+            available_kw += power_w / 1000.0
+
+        # Uśrednianie — wygładzamy migotanie ±0.x kW przez ostatnie 3 odczyty (90s)
+        self._surplus_history.append(available_kw)
+        if len(self._surplus_history) > PCC_HISTORY_SIZE:
+            self._surplus_history.pop(0)
+        avg_available_kw = sum(self._surplus_history) / len(self._surplus_history)
+
+        # SURPLUS_BIAS_W to bufor zachęcający do startu (patrz definicja stałej).
+        # Bez floora: przy imporcie surplus_w schodzi poniżej zera, dzięki czemu
+        # regulacja w trybie SOLAR widzi wielkość deficytu i redukuje prąd / STOPuje.
+        surplus_w = avg_available_kw * 1000 + SURPLUS_BIAS_W
 
         return {
-            "soc":        soc,
-            "pv_power":   pv_power * 1000,
-            "load_power": load_power * 1000,
-            "grid_power": grid_power,
-            "avg_pcc":    avg_pcc,
-            "surplus_w":  surplus_w,
-            "price":      price,
+            "soc":              soc,
+            "pv_power":         pv_power * 1000,
+            "load_power":       load_power * 1000,
+            "grid_power":       grid_power,
+            "avg_available_kw": avg_available_kw,
+            "surplus_w":        surplus_w,
+            "price":            price,
         }
 
     # ------------------------------------------------------------------
@@ -371,7 +425,7 @@ class EVChargerControl(hass.Hass):
         # 2. Ujemna cena energii
         if price < NEGATIVE_PRICE_THRESHOLD:
             self.log(f"Tryb NEGATIVE_PRICE: cena={price:.2f} zl/kWh")
-            return ("NEGATIVE_PRICE", MAX_CURRENT_A)
+            return ("NEGATIVE_PRICE", NEGATIVE_PRICE_CURRENT_A)
 
         # 3. Tryb zimowy — nocne ładowanie z sieci
         winter_mode = self.get_state(WINTER_MODE_ENTITY) == "on"
@@ -388,18 +442,13 @@ class EVChargerControl(hass.Hass):
             return ("BATTERY_PRIORITY", 0)
 
         # 5. Tryb solarny
-        charger_working = charger_status in CHARGER_WORKING_STATES
-        charger_power_w = charger_data["power_w"]
-
-        # Gdy ładujemy, pobór ładowarki jest już wliczony w load — dodaj do dostępnej nadwyżki
-        if charger_working and charger_power_w > 0:
-            available_surplus = surplus + charger_power_w
-        else:
-            available_surplus = surplus
+        # surplus zawiera już kompensację poboru ładowarki (patrz _get_ha_data)
+        charger_working   = charger_status in CHARGER_WORKING_STATES
+        available_surplus = surplus
 
         self.log(
             f"SOC={soc:.0f}%, PV={ha_data['pv_power']:.0f}W, "
-            f"PCC={ha_data['grid_power']:.2f}kW (avg={ha_data['avg_pcc']:.2f}kW), "
+            f"PCC={ha_data['grid_power']:.2f}kW (avg_dost={ha_data['avg_available_kw']:.2f}kW), "
             f"nadwyzka={available_surplus:.0f}W, "
             f"ladowarka={charger_status}, cena={price:.2f}"
         )
@@ -434,29 +483,94 @@ class EVChargerControl(hass.Hass):
 
         if mode in ("NEGATIVE_PRICE", "SOLAR", "WINTER_NIGHT", "EMERGENCY"):
             if target_current > 0 and target_current != self._last_sent_current:
-                self._set_current(target_current)
-                self._last_sent_current = target_current
+                # _last_sent_current tylko przy sukcesie — porażka wysyłki
+                # zostawia różnicę wartości, więc ponowienie wyjdzie za 30 s.
+                if self._set_current(target_current):
+                    self._last_sent_current = target_current
             if not charger_working:
-                if self._last_sent_switch != True:
-                    self._clear_schedule()
-                    self._set_switch(True)
-                    self._last_sent_switch = True
-                    self._charger_active   = True
-                    if self._session_start_time is None:
-                        self._session_start_time  = datetime.datetime.now()
-                        self._current_session_kwh = 0.0
+                if self._last_sent_switch is not True:
+                    # Pierwsza próba (albo ponowienie po nieudanej wysyłce).
+                    self._send_start()
+                else:
+                    # START poszedł, ale wallbox wciąż nie ładuje — ponów
+                    # z backoffem, z limitem prób (auto może być po prostu pełne).
+                    self._switch_mismatch_iters += 1
+                    if self._switch_mismatch_iters >= SWITCH_RETRY_ITERATIONS:
+                        self._switch_mismatch_iters = 0
+                        if self._start_retries < SWITCH_MAX_START_RETRIES:
+                            self._start_retries += 1
+                            self.log(
+                                f"START bez efektu (status={charger_status}) — "
+                                f"ponawiam ({self._start_retries}/{SWITCH_MAX_START_RETRIES})",
+                                level="WARNING")
+                            self._send_start()
+                        elif self._start_retries == SWITCH_MAX_START_RETRIES:
+                            self._start_retries += 1   # żeby zalogować tylko raz
+                            self.log(
+                                f"START ponawiany {SWITCH_MAX_START_RETRIES}x bez efektu "
+                                f"(status={charger_status}) — odpuszczam do zmiany warunków "
+                                f"(auto pelne / odlaczone?)", level="WARNING")
             else:
-                self._charger_active = True
+                # Stan zgadza się z intencją — wyzeruj liczniki ponowień.
+                self._charger_active        = True
+                self._switch_mismatch_iters = 0
+                self._start_retries         = 0
+                self._stop_retries          = 0
 
         elif mode in ("BATTERY_PRIORITY", "IDLE", "OFFLINE"):
             if charger_working:
-                if self._last_sent_switch != False:
-                    self._set_switch(False)
-                    self._last_sent_switch = False
+                if self._last_sent_switch is not False:
+                    if self._set_switch(False):
+                        self._last_sent_switch      = False
+                        self._switch_mismatch_iters = 0
+                    # porażka wysyłki: _last_sent_switch bez zmian -> retry za 30 s
+                else:
+                    # STOP poszedł, ale wallbox dalej ładuje — ponawiaj co
+                    # SWITCH_RETRY_ITERATIONS, ale z limitem: każdy STOP to cykl
+                    # stycznika, a wieczne klikanie było Problemem 13.
+                    self._switch_mismatch_iters += 1
+                    if self._switch_mismatch_iters >= SWITCH_RETRY_ITERATIONS:
+                        self._switch_mismatch_iters = 0
+                        if self._stop_retries < SWITCH_MAX_STOP_RETRIES:
+                            self._stop_retries += 1
+                            self.log(
+                                f"STOP bez efektu (status={charger_status}) — ponawiam "
+                                f"({self._stop_retries}/{SWITCH_MAX_STOP_RETRIES})",
+                                level="WARNING")
+                            self._set_switch(False)
+                        elif self._stop_retries == SWITCH_MAX_STOP_RETRIES:
+                            self._stop_retries += 1   # żeby zalogować tylko raz
+                            self.log(
+                                f"STOP ponawiany {SWITCH_MAX_STOP_RETRIES}x bez efektu — "
+                                f"wallbox laduje mimo trybu {mode}. Przestaje klikac "
+                                f"stycznikiem; sprawdz wallboxa (Reboot z Smart Life?)",
+                                level="ERROR")
                 self._charger_active     = False
                 self._session_start_time = None
-            elif self._charger_active:
-                self._charger_active = False
+            else:
+                if self._charger_active:
+                    self._charger_active = False
+                # Ładowarka stoi i o to nam chodziło — stan spójny z intencją
+                # "wyłączone". Zapamiętanie tego sprawia, że po powrocie nadwyżki
+                # START pójdzie od razu, a nie dopiero po cyklu ponowień.
+                self._last_sent_switch      = False
+                self._switch_mismatch_iters = 0
+                self._start_retries         = 0
+                self._stop_retries          = 0
+
+    def _send_start(self):
+        """Wyślij START (z czyszczeniem harmonogramu). _last_sent_switch
+        aktualizowany tylko przy udanej wysyłce — inaczej ponowimy za 30 s."""
+        self._clear_schedule()
+        if not self._set_switch(True):
+            return False
+        self._last_sent_switch      = True
+        self._switch_mismatch_iters = 0
+        self._charger_active        = True
+        if self._session_start_time is None:
+            self._session_start_time  = datetime.datetime.now()
+            self._current_session_kwh = 0.0
+        return True
 
     # ------------------------------------------------------------------
     # KOMUNIKACJA Z ŁADOWARKĄ
@@ -476,15 +590,19 @@ class EVChargerControl(hass.Hass):
         try:
             self._device.set_value(DP_CURRENT, current_a)
             self.log(f"Ustawiono prad: {current_a}A")
+            return True
         except Exception as e:
             self.log(f"Blad ustawiania pradu: {e}", level="ERROR")
+            return False
 
     def _set_switch(self, on: bool):
         try:
             self._device.set_value(DP_SWITCH, on)
             self.log(f"Ladowarka: {'START' if on else 'STOP'}")
+            return True
         except Exception as e:
             self.log(f"Blad przelaczania: {e}", level="ERROR")
+            return False
 
     # ------------------------------------------------------------------
     # LICZNIKI ENERGII
@@ -503,8 +621,10 @@ class EVChargerControl(hass.Hass):
             )
             self._month_energy_kwh = 0.0
             self._last_ym = current_ym
-            self._save_persistent("ev_last_ym", current_ym)
-            self._save_persistent("ev_month_energy_kwh", self._month_energy_kwh)
+            self._save_persistent_many({
+                "ev_last_ym":          current_ym,
+                "ev_month_energy_kwh": self._month_energy_kwh,
+            })
         if self._last_update_time is not None and charger_data["online"]:
             dt_hours   = (now - self._last_update_time).total_seconds() / 3600.0
             energy_kwh = (charger_data["power_w"] * dt_hours) / 1000.0
@@ -512,8 +632,10 @@ class EVChargerControl(hass.Hass):
                 self._current_session_kwh += energy_kwh
                 self._month_energy_kwh    += energy_kwh
                 self._total_energy_kwh    += energy_kwh
-                self._save_persistent("ev_month_energy_kwh", self._month_energy_kwh)
-                self._save_persistent("ev_total_energy_kwh", self._total_energy_kwh)
+                self._save_persistent_many({
+                    "ev_month_energy_kwh": self._month_energy_kwh,
+                    "ev_total_energy_kwh": self._total_energy_kwh,
+                })
             if (charger_data["status"] not in CHARGER_WORKING_STATES
                     and self._session_start_time is not None):
                 duration = (now - self._session_start_time).total_seconds() / 60.0
@@ -524,6 +646,11 @@ class EVChargerControl(hass.Hass):
                 self._session_start_time = None
         self._last_update_time = now
         self._last_power_w     = charger_data["power_w"]
+        if charger_data["power_w"] > 0:
+            self._last_nonzero_power_w = charger_data["power_w"]
+        elif charger_data["status"] not in CHARGER_WORKING_STATES:
+            # Sesja realnie stoi — nie ma czego kompensować przy następnym starcie.
+            self._last_nonzero_power_w = 0.0
         # Zapamiętaj stan liczników miesięcznych — posłuży za snapshot
         # "koniec miesiąca" przy najbliższym przełomie.
         self._um_snapshot = self._read_um_snapshot()
@@ -680,19 +807,20 @@ class EVChargerControl(hass.Hass):
                 emergency_remaining_min = int(
                     (self._emergency_end_time - datetime.datetime.now()).total_seconds() / 60
                 )
+            # separators + int — input_text ma limit 255 znaków, margines był wąski
             data = json.dumps({
                 "status":                  charger_data["status"],
                 "mode":                    mode,
-                "power":                   round(charger_data["power_w"], 0),
+                "power":                   int(round(charger_data["power_w"])),
                 "current":                 charger_data["current_a"],
                 "target_current":          target_current,
                 "session":                 round(self._current_session_kwh, 3),
                 "month":                   round(self._month_energy_kwh, 3),
                 "total":                   round(self._total_energy_kwh, 3),
-                "surplus_w":               round(ha_data["surplus_w"], 0),
+                "surplus_w":               int(round(ha_data["surplus_w"])),
                 "soc":                     ha_data["soc"],
                 "emergency_remaining_min": emergency_remaining_min,
-            })
+            }, separators=(",", ":"))
             self.call_service("input_text/set_value",
                 entity_id="input_text.ev_charger_status",
                 value=charger_data["status"])
@@ -709,40 +837,55 @@ class EVChargerControl(hass.Hass):
     # PERSISTENT STORAGE
     # ------------------------------------------------------------------
 
-    def _save_persistent(self, key, value):
+    def _read_persistent_file(self):
+        """Wczytaj cały plik persistent. Uszkodzony JSON (np. crash w trakcie
+        zapisu starym kodem) odkładamy jako .corrupt i startujemy od pustego —
+        inaczej każdy kolejny zapis padał w nieskończoność na json.load."""
         try:
-            path = "/config/ev_charger_data.json"
-            data = {}
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    data = json.load(f)
-            data[key] = value
-            with open(path, "w") as f:
+            if not os.path.exists(_PERSIST_PATH):
+                return {}
+            with open(_PERSIST_PATH, "r") as f:
+                return json.load(f)
+        except ValueError as e:
+            corrupt = _PERSIST_PATH + ".corrupt"
+            try:
+                os.replace(_PERSIST_PATH, corrupt)
+                self.log(f"Uszkodzony {_PERSIST_PATH} ({e}) — kopia w {corrupt}, "
+                         f"zaczynam od pustego", level="ERROR")
+            except OSError as e2:
+                self.log(f"Blad odczytu persistent: {e}; nie udalo sie odlozyc kopii: {e2}",
+                         level="ERROR")
+            return {}
+        except Exception as e:
+            self.log(f"Blad odczytu persistent: {e}", level="WARNING")
+            return {}
+
+    def _write_persistent_file(self, data):
+        """Zapis atomowy (tmp + os.replace) — crash w trakcie zapisu nie może
+        zniszczyć pliku z licznikami i 10-letnim archiwum."""
+        try:
+            tmp = _PERSIST_PATH + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(data, f)
+            os.replace(tmp, _PERSIST_PATH)
         except Exception as e:
             self.log(f"Blad zapisu persistent: {e}", level="WARNING")
 
+    def _save_persistent(self, key, value):
+        self._save_persistent_many({key: value})
+
+    def _save_persistent_many(self, updates):
+        """Kilka kluczy w jednym read-modify-write (mniej I/O w pętli 30 s)."""
+        data = self._read_persistent_file()
+        data.update(updates)
+        self._write_persistent_file(data)
+
     def _load_persistent(self, key, default):
         try:
-            path = "/config/ev_charger_data.json"
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    data = json.load(f)
-                return float(data.get(key, default))
-            return default
-        except Exception as e:
-            self.log(f"Blad odczytu persistent: {e}", level="WARNING")
+            return float(self._read_persistent_file().get(key, default))
+        except (TypeError, ValueError):
             return default
 
     def _load_persistent_raw(self, key, default):
         """Jak _load_persistent, ale bez rzutowania na float — dla stringów/list/dictów."""
-        try:
-            path = "/config/ev_charger_data.json"
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    data = json.load(f)
-                return data.get(key, default)
-            return default
-        except Exception as e:
-            self.log(f"Blad odczytu persistent: {e}", level="WARNING")
-            return default
+        return self._read_persistent_file().get(key, default)

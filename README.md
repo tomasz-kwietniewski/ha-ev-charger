@@ -9,9 +9,9 @@ Skrypt AppDaemon steruje ładowarką EV (protokół Tuya 3.5) lokalnie przez sie
 | Tryb | Warunek | Działanie |
 |------|---------|-----------|
 | `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen |
-| `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na maksimum (16A) |
+| `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na 13A (~9 kW, bufor ~2 kW na dom przy przyłączu 11 kW) |
 | `WINTER_NIGHT` | Tryb zimowy włączony, godz. 22–6 | Ładuj na 10A (tania taryfa nocna) |
-| `SOLAR` | SOC baterii ≥ 95% i nadwyżka PV ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A) |
+| `SOLAR` | SOC baterii ≥ 95% i nadwyżka ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A); nadwyżka = min(eksport PCC, PV − zużycie domu) + bias |
 | `BATTERY_PRIORITY` | SOC < 95% | Czekaj, priorytet ładowania baterii |
 | `IDLE` | Brak nadwyżek lub auto niepodłączone | Ładowarka wyłączona |
 
@@ -39,7 +39,7 @@ appdaemon:
 
 ### Krok 2 — Secrets
 
-Skopiuj `ev_charger_secrets.json.example` jako `ev_charger_secrets.json` do katalogu add-onu AppDaemon i uzupełnij danymi urządzenia:
+Skopiuj `appdaemon/ev_charger_secrets.json.example` jako `ev_charger_secrets.json` do katalogu add-onu AppDaemon i uzupełnij danymi urządzenia:
 
 ```
 /addon_configs/a0d7b954_appdaemon/ev_charger_secrets.json
@@ -95,9 +95,9 @@ Tworzone są m.in.:
 
 ### Krok 6 — Dashboard
 
-Dodaj kartę z `homeassistant/lovelace_ev_card.yaml` do swojego dashboardu. Zawiera panel sterowania trybem awaryjnym, status ładowania i statystyki energii.
+Dla archiwum miesiąc do miesiąca dodaj karty z `homeassistant/lovelace_ev_history_card.yaml` (wykres słupkowy + tabela + przycisk ręcznej archiwizacji). Wykres słupkowy wymaga karty `apexcharts-card` z HACS; tabela Markdown działa natywnie, bez HACS.
 
-Dla archiwum miesiąc do miesiąca dołóż karty z `homeassistant/lovelace_ev_history_card.yaml` (wykres słupkowy + tabela). Wykres słupkowy wymaga karty `apexcharts-card` z HACS; tabela Markdown działa natywnie, bez HACS.
+Panel sterowania (toggle trybu awaryjnego/zimowego, status, statystyki) złóż z sensorów opisowych (`sensor.ev_status_opis`, `sensor.ev_tryb_opis`, `sensor.ev_moc_ladowania` itd.) w dowolnej karcie Entities — repo nie narzuca gotowego layoutu.
 
 ## Historia miesięczna
 
@@ -137,28 +137,34 @@ SOC_THRESHOLD     = 95   # [%] poniżej - nie ładuj auta (ochrona baterii)
 SOC_EMERGENCY_MIN = 20   # [%] w trybie EMERGENCY zatrzymaj gdy SOC < tej wartości
 MIN_CURRENT_A     = 6    # [A] minimum ładowarki
 MAX_CURRENT_A     = 16   # [A] maksimum ładowarki
-EMERGENCY_CURRENT_A = 13 # [A] tryb emergency (~9 kW, bufor 2 kW na dom)
+EMERGENCY_CURRENT_A      = 13  # [A] tryb emergency (~9 kW, bufor 2 kW na dom)
+NEGATIVE_PRICE_CURRENT_A = 13  # [A] ujemna cena — też z buforem na dom
 START_SURPLUS_W   = 1600 # [W] min nadwyżka do startu (razem z SURPLUS_BIAS_W)
 STOP_SURPLUS_W    = 1200 # [W] poniżej - zatrzymaj ładowanie (histereza)
-SURPLUS_BIAS_W    = 1000 # [W] bufor doliczany do PCC — start już przy ~0,6 kW eksportu
+SURPLUS_BIAS_W    = 1000 # [W] bufor doliczany do nadwyżki — start już przy ~0,6 kW eksportu
 PCC_HISTORY_SIZE  = 3    # ile odczytów uśredniać (3 * 30s = 90s)
 WATCHDOG_FROZEN_DP_THRESHOLD = 20  # iteracji WORKING+0W zanim watchdog ostrzeże (=10 min)
+SWITCH_RETRY_ITERATIONS  = 4  # co ile iteracji ponawiać START/STOP przy niezgodności stanu
+SWITCH_MAX_START_RETRIES = 3  # ile razy ponawiać START zanim skrypt odpuści (auto pełne?)
 ```
+
+Nadwyżka dla trybu SOLAR to `min(eksport PCC, PV − zużycie domu) + pobór ładowarki`, uśredniona przez 3 odczyty i powiększona o `SURPLUS_BIAS_W`. Samo PCC nie wystarcza, bo falownik hybrydowy w trybie self-use trzyma PCC blisko zera rozładowując magazyn i deficyt byłby niewidoczny (skrypt podkręcałby prąd kosztem baterii domowej). Przy imporcie nadwyżka jest ujemna (bez podłogi), dzięki czemu regulacja redukuje prąd i histereza STOP faktycznie działa. Pobór ładowarki doliczany jest **przed** uśrednianiem — inaczej średnia miesza próbki mierzone przy różnej mocy ładowania i prąd skacze tuż po starcie sesji (szczegóły: docs, Problem 19).
 
 ## Struktura plików
 
 ```
 ha-ev-charger/
-├── CLAUDE.md                          ← kontekst projektu dla Claude Code
 ├── README.md
+├── deploy.sh                          ← deploy przez SSH (backup + restart + rollback)
 ├── appdaemon/
 │   ├── apps/ev_charger.py             ← główny skrypt sterujący
-│   └── apps.yaml                      ← rejestr aplikacji AppDaemon
+│   ├── apps.yaml                      ← rejestr aplikacji AppDaemon
+│   └── ev_charger_secrets.json.example ← szablon danych urządzenia
 ├── homeassistant/
 │   ├── configuration.yaml             ← template sensory + utility meters
-│   ├── lovelace_ev_card.yaml          ← karta dashboardu z trybem awaryjnym
-│   └── lovelace_ev_history_card.yaml  ← karty archiwum (wykres + tabela)
-├── ev_charger_secrets.json.example    ← szablon danych urządzenia
+│   └── lovelace_ev_history_card.yaml  ← karty archiwum (wykres + tabela + przycisk)
+├── tests/
+│   └── test_ev_charger.py             ← lekkie testy jednostkowe (bez zależności)
 └── docs/
     └── ladowanie_ev_z_nadwyzek_pv.md  ← artykuł techniczny
 ```
@@ -179,6 +185,8 @@ ha-ev-charger/
 - **Stan PAUSE** — gdy auto podłączone ale harmonogram wstrzymał ładowanie, ładowarka raportuje PAUSE zamiast IDLE; skrypt obsługuje oba stany jako "gotowy do ładowania"
 - **Znak PCC Sofara** — w tej instalacji dodatni = eksport, ujemny = import; może być odwrotnie — weryfikuj empirycznie po każdej zmianie trybu falownika
 - **Migotanie PCC** — wartość PCC oscyluje ±0,2 kW nawet przy stabilnej pracy; bez uśredniania skrypt niepotrzebnie zmienia prąd co 30 sekund
+- **Samo PCC nie wystarcza do regulacji** — falownik hybrydowy w trybie self-use kompensuje deficyt z magazynu, trzymając PCC blisko zera; nadwyżkę liczymy jako `min(PCC, PV − dom)`, inaczej regulacja podkręca prąd kosztem baterii domowej
+- **Dedup komend wymaga ponowień** — zapamiętywanie ostatnio wysłanego START/STOP chroni przed spamem, ale bez retry jedna zgubiona komenda blokuje sterowanie na stałe (patrz Problem 19)
 - **Moc DP 102 × 100** — wartości mocy per faza są mnożone przez 100, `32` oznacza 3200W
 - **DP 102 potrafi się „zamrozić"** — firmware dé EV Charger v2.9.4 czasami przestaje aktualizować cały blok pomiarów (L1/L2/L3 + pola `p`/`e`/`t`); status nadal `WORKING`, ale moc zwracana to 0 W mimo realnego ładowania. Lekarstwo: **Reboot z aplikacji Smart Life** (Settings → Reboot, nie Reset to Factory). Skrypt ma watchdog ostrzegający w logach po 10 min utrzymującego się WORKING+0W w aktywnym trybie ładowania.
 - **DP 102 ma ukryte pole `e` = energia sesji × 0,1 kWh** — niezależny od naszego liczenia `power × dt`, można użyć jako kontrolny licznik energii sesji
@@ -202,6 +210,16 @@ Po każdej zmianie kodu użyj skryptu deploy (wymaga Git Bash lub WSL, SSH alias
 Skrypt automatycznie: sprawdza składnię Python, tworzy backup z timestampem w `/addon_configs/a0d7b954_appdaemon/_backups/`, wgrywa pliki przez `scp`, restartuje AppDaemon i weryfikuje logi. W razie błędu oferuje rollback.
 
 > **Uwaga:** backupy muszą leżeć **poza** folderem `apps/` — AppDaemon skanuje go rekurencyjnie i załadowałby stare pliki YAML z backupu jako dodatkowe aplikacje.
+
+## Testy
+
+Lekki runner bez zewnętrznych zależności (stubuje AppDaemon, TinyTuya i `requests`):
+
+```bash
+python tests/test_ev_charger.py
+```
+
+Pokrywa logikę decyzyjną (`_decide`, `_surplus_to_current`), liczenie nadwyżki przy deficycie i maskowaniu przez magazyn, ponowienia komend START/STOP, detekcję błędów TinyTuya, atomowość persystencji i limit 255 znaków `input_text.ev_data`. Warto uruchomić przed każdym `./deploy.sh`.
 
 ## Konfiguracja środowiskowa
 

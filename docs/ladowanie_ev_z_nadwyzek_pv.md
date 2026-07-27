@@ -481,6 +481,28 @@ Diabeł tkwił w dwóch szczegółach, które warto znać:
 
 ---
 
+## Audyt kodu, czyli co siedziało w skrypcie przez trzy miesiące
+
+Skrypt działał od maja i robił swoje, więc przez długi czas nie było powodu do niego zaglądać. W lipcu usiadłem do porządnego przeglądu całości: linijka po linijce, z pytaniem „czy to na pewno robi to, co myślę". Wyszły cztery błędy, z czego dwa realnie kosztowały mnie energię z magazynu domowego. Żaden nie rzucał się w oczy w logach, bo żaden nie powodował awarii. Po prostu system zachowywał się odrobinę inaczej, niż sądziłem.
+
+**Najciekawszy okazał się błąd w samej regulacji.** Gdy nadeszła chmura i zaczynałem pobierać prąd z sieci, skrypt zamiast zejść z mocy ładowania, *podkręcał* ją. Krok po kroku: 6A, 7A, 8A, aż do maksimum. Powód jest podręcznikowy i dlatego wart opisania: przy imporcie kod gubił informację o tym, jak duży jest deficyt, i podstawiał w to miejsce stałą wartość. A ponieważ do nadwyżki dolicza się moc ładowarki, każda kolejna iteracja widziała „więcej dostępnej mocy" niż poprzednia. Klasyczne dodatnie sprzężenie zwrotne, w pętli, którą sam napisałem i której przez kwartał nie zauważyłem. Ładowanie kończyło się dopiero wtedy, gdy magazyn domowy spadł poniżej 95% i wchodził tryb priorytetu baterii, czyli już po niepotrzebnym cyklu rozładowania.
+
+Przy okazji wyszła rzecz, która zmieniła moje rozumienie własnej instalacji. **Licznik na złączu z siecią nie mówi prawdy o nadwyżce, jeśli ma się falownik hybrydowy.** Sofar w trybie autokonsumpcji aktywnie dopełnia deficyt z magazynu, żeby utrzymać zerowy bilans z siecią. Efekt jest taki, że przy PV 1 kW, domu 5 kW i aucie ciągnącym 4 kW licznik pokazuje spokojne zero, a bateria w garażu po cichu się opróżnia. Teraz nadwyżkę liczę jako minimum z dwóch rzeczy: tego, co faktycznie wypycham do sieci, i tego, co zostaje z produkcji po odjęciu zużycia domu. Pierwsze pilnuje, żeby nie podbierać mocy ładującej się baterii, drugie widzi deficyt, który bateria maskuje.
+
+**Drugi poważny błąd był bardziej perfidny, bo powstał przy naprawianiu innego błędu.** W maju walczyłem z tym, że skrypt co 30 sekund wysyłał do wallboxa komendę STOP i słychać było klikanie stycznika (Problem 13). Naprawa była prosta: zapamiętuj, co ostatnio wysłałeś, i nie powtarzaj. Tyle że zapamiętywanie działo się także wtedy, gdy wysyłka się nie udała. Wystarczył jeden zgubiony pakiet Wi-Fi (a wallbox stoi w garażu, zasięg bywa marny), żeby skrypt do końca życia procesu był przekonany, że komendę wysłał. W praktyce: ładowanie nie ruszało, dopóki czegoś nie zrestartowałem, albo, w drugą stronę, auto ładowało się mimo trybu priorytetu baterii.
+
+Ten drugi wariant potwierdził się w najlepszy możliwy sposób: dokładnie w chwili wgrywania poprawki. Auto ciągnęło wtedy 5,2 kW przy magazynie naładowanym w 46%, czyli w sytuacji, w której skrypt od dawna powinien był je zatrzymać. Nie zatrzymywał, bo miał zapisane, że już to zrobił. Nowa wersja ucięła sesję w pierwszej iteracji po restarcie. Trudno o lepszy dowód, że błąd nie był teoretyczny.
+
+Do tego doszły dwie rzeczy z gatunku „cicha awaria". Biblioteka TinyTuya przy problemach z siecią nie zgłasza wyjątku, tylko zwraca słownik z kluczem `Error`, a stary kod interpretował to jako „ładowarka gotowa do pracy". I plik z licznikami energii oraz dziesięcioletnim archiwum zapisywał się nieatomowo, więc jedno przerwanie w złym momencie mogło go uszkodzić tak, że od tej pory każdy kolejny zapis cicho padał, a liczniki wracały do zera.
+
+### Czego się nauczyłem o testowaniu takich systemów
+
+Napisałem do skryptu zestaw prostych testów, bez żadnego frameworka, podmieniając AppDaemon i TinyTuya atrapami. Ale najwięcej dała nie tabelka testów, tylko **symulacja całego dnia**: słońce, chmura, powrót słońca, wieczór, z wallboxem reagującym na komendy jak prawdziwy. Dopiero ona pokazała błąd, którego testy jednostkowe nie widziały, bo dotyczył kolejności operacji. Uśrednianie odczytów robiłem *przed* doliczeniem poboru ładowarki, przez co średnia mieszała próbki mierzone przy różnej mocy ładowania i tuż po starcie sesji prąd skakał na maksimum.
+
+Wniosek na przyszłość jest chyba taki: przy sterowaniu ze sprzężeniem zwrotnym sprawdzanie pojedynczych funkcji to za mało. Trzeba puścić pętlę w czasie i zobaczyć, dokąd zbiega. Po poprawkach symulacja wygląda tak, jak powinna: 11A stabilnie w pełnym słońcu, przy chmurze redukcja 10, 8, 7, 6 amperów, stop, a potem płynny powrót w górę.
+
+---
+
 ## Koszt całego rozwiązania
 
 | Element                                         | Koszt               |

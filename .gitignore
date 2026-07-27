@@ -22,3 +22,9 @@ __pycache__/
 # nie publikujemy w publicznym repo). Jeśli kiedyś będziesz chciał zacommitować
 # konkretny PDF (np. własną dokumentację), użyj `git add -f`.
 docs/*.pdf
+
+# Artefakty Playwright MCP — snapshoty drzewa dostępności i zrzuty ekranu
+# z weryfikacji w przeglądarce. Generowane przy każdej sesji, bez wartości w repo.
+# UWAGA: zrzuty zapisywane pod względną nazwą lądują w korzeniu repo, nie tutaj —
+# podawać ścieżkę `.playwright-mcp/nazwa.png`, żeby nie zaśmiecać `git status`.
+.playwright-mcp/

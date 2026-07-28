@@ -419,6 +419,40 @@ Poprawka: sprawdzamy `"Error" in raw` i traktujemy taką odpowiedź jak brak ł�
 
 Poprawka: zapis do pliku tymczasowego i `os.replace()` (atomowy na tym samym systemie plików), a nieczytelny plik jest odkładany jako `.corrupt` i skrypt startuje od pustego stanu zamiast zapętlać się na błędzie. Zapisy `ev_month_energy_kwh` i `ev_total_energy_kwh` zostały scalone w jeden read-modify-write zamiast dwóch na iterację.
 
+### Problem 23: Regulacja goniąca szum — ładowarka pikająca co 30 sekund
+
+Ten problem zgłosiło ucho, nie log. Pierwszego dnia po naprawie regulacji usłyszałem przez okno, że wallbox pika bardzo często. Logi potwierdziły od razu: w ciągu trzech minut prąd zmienił się pięć razy, w tym sekwencja **10A → 11A → 10A w ciągu 60 sekund**.
+
+Przyczyny są dwie i obie są pouczające.
+
+**Brak strefy nieczułości.** Komenda szła do ładowarki, ilekroć nowy cel różnił się od poprzedniego choćby o 1 A:
+
+```python
+if target_current > 0 and target_current != self._last_sent_current:
+```
+
+Jeden amper to jednak tylko 690 W (3 fazy × 230 V), a `int()` obcina wynik dzielenia. Gdy nadwyżka stanęła dokładnie na granicy stopnia, wystarczyło wahanie rzędu **±30 W**, czyli ułamka procenta, żeby cel przeskakiwał w każdej iteracji. W symulacji „stabilnego słońca" z takim właśnie szumem stary kod wygenerował 29 zmian prądu w 15 minut.
+
+**Pętla szybsza niż obiekt, którym steruje.** To poważniejsza sprawa. Porównanie celu z rzeczywistą mocą pokazało, że auto dochodzi do zadanego prądu z opóźnieniem około minuty: przy celu 10A moc odpowiadała najpierw 8,5A, minutę później 9,4A. Ponieważ zmierzony pobór ładowarki wraca do wyliczenia nadwyżki, sterownik reagował na stan, który jeszcze się nie ustalił, i sam sobie generował oscylacje. Klasyczny błąd w regulacji ze sprzężeniem zwrotnym.
+
+Rozwiązanie ma dwie warstwy. **Histereza ±250 W wokół progu stopnia**: żeby podnieść prąd, nadwyżka musi przekroczyć próg z zapasem, i tak samo w drugą stronę. To samo w sobie zabija przeskoki na granicy. **Potwierdzenie zmiany w czasie**: nowy cel musi utrzymać się przez 2 iteracje (60 s), zanim komenda pójdzie do wallboxa.
+
+Wyjątkiem jest spadek o 3 A lub więcej — ten idzie natychmiast, bo chroni przyłącze 11 kW, gdy nagle ruszy pompa ciepła albo piekarnik.
+
+Świadomie wygładzam też **małe** redukcje, choć pierwszy szkic poprawki miał je wykonywać od ręki. Zmieniłem zdanie po prostej refleksji: krótkie zejście w magazyn domowy nie jest tragedią, bo magazyn i tak się doładuje, gdy słońce wyjdzie zza chmury. Rzadsze szarpanie ładowarką jest tego warte.
+
+Efekt zmierzony na symulacji, w tym na realnych nadwyżkach z logów:
+
+| Scenariusz | Przed | Po |
+| --- | --- | --- |
+| Realne logi (3 minuty) | 5 zmian | 1 |
+| Pochmurne 30 minut | 52 zmiany | 1 |
+| Stabilne słońce 15 minut | 29 zmian | 0 |
+
+Koszt wolniejszego podbijania mocy to 0,04-0,09 kWh, czyli kilka groszy. Weryfikacja na produkcji potwierdziła rzecz jeszcze ładniejszą: w oknie 2,5 minuty PV spadło chwilowo z 6,8 kW do 1,6 kW (przelotna chmura), a prąd **nie zmienił się ani razu** — dołek nie utrzymał się przez wymagane dwie iteracje, więc sterownik go zignorował i słońce wróciło.
+
+**Wniosek ogólny:** przy sterowaniu z pętlą zwrotną nie wystarczy poprawnie policzyć wartość zadaną. Trzeba jeszcze zapytać, jak szybko obiekt na nią odpowiada, i nie wysyłać komend częściej. Inaczej regulator ściga własny ogon.
+
 ---
 
 ## Helpery w Home Assistant
@@ -641,4 +675,4 @@ Latem planujemy naładować całą baterię 75 kWh praktycznie bez kosztów. Pol
 
 ---
 
-*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu). Aktualizacja 4: 8 czerwca 2026 — Problemy 13–16 (STOP-spam w gałęzi IDLE, zamrożony DP 102 w firmware dé EV v2.9.4, chmura Tuya a harmonogram DP 151, ukryte pole `e` = energia sesji × 0,1 kWh); archiwum historii miesięcznej z retencją 10 lat — wykres i tabela porównawcza na dashboardzie, ręczny przycisk archiwizacji (Problemy 17–18: dane ginące przy resecie miesiąca oraz `set_state` 400 w HA 2026.x -> publikacja przez REST API rdzenia). Aktualizacja 5: 27 lipca 2026 — audyt kodu, Problemy 19–22: regulacja SOLAR „uciekająca" w górę przy zachmurzeniu (nadwyżka liczona teraz jako `min(PCC, PV − dom)` bez podłogi), dedup komend START/STOP bez ponowień, TinyTuya zwracająca błąd jako dict zamiast wyjątku, nieatomowy zapis pliku persistent; tryb NEGATIVE_PRICE zszedł z 16A na 13A (bufor na dom), doszły lekkie testy jednostkowe w `tests/`.*
+*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu). Aktualizacja 4: 8 czerwca 2026 — Problemy 13–16 (STOP-spam w gałęzi IDLE, zamrożony DP 102 w firmware dé EV v2.9.4, chmura Tuya a harmonogram DP 151, ukryte pole `e` = energia sesji × 0,1 kWh); archiwum historii miesięcznej z retencją 10 lat — wykres i tabela porównawcza na dashboardzie, ręczny przycisk archiwizacji (Problemy 17–18: dane ginące przy resecie miesiąca oraz `set_state` 400 w HA 2026.x -> publikacja przez REST API rdzenia). Aktualizacja 6: 28 lipca 2026 — Problem 23: regulacja goniąca szum (prąd zmieniany co 30 s, sekwencje 10A → 11A → 10A). Histereza ±250 W wokół progu stopnia plus potwierdzenie zmiany przez 2 iteracje; duży spadek nadal natychmiastowy. Zmierzone: 52 → 1 zmiana w pochmurne pół godziny. Aktualizacja 5: 27 lipca 2026 — audyt kodu, Problemy 19–22: regulacja SOLAR „uciekająca" w górę przy zachmurzeniu (nadwyżka liczona teraz jako `min(PCC, PV − dom)` bez podłogi), dedup komend START/STOP bez ponowień, TinyTuya zwracająca błąd jako dict zamiast wyjątku, nieatomowy zapis pliku persistent; tryb NEGATIVE_PRICE zszedł z 16A na 13A (bufor na dom), doszły lekkie testy jednostkowe w `tests/`.*

@@ -123,6 +123,8 @@ def make_ctrl(states=None):
     c.states = dict(states or {})
     c._surplus_history = []
     c._last_sent_current = -1
+    c._pending_current = -1
+    c._pending_iters = 0
     c._last_sent_switch = None
     c._switch_mismatch_iters = 0
     c._start_retries = 0
@@ -237,6 +239,74 @@ def test_solar_regulation_converges_under_cloud():
     solar_targets = [t for m, t in targets if m == "SOLAR"]
     assert solar_targets == sorted(solar_targets, reverse=True), \
         f"prad ma maleć, nie rosnąć: {solar_targets}"
+
+
+def test_current_does_not_chatter_at_step_boundary():
+    # REGRESJA (zaobserwowane 2026-07-28 13:36-13:37): 10A -> 11A -> 10A w 60 s.
+    # Nadwyzka oscylowala wokol granicy stopnia 11A (7590 W), a gole int()
+    # przerzucalo cel tam i z powrotem. Wallbox pikal przy kazdej zmianie.
+    c = make_ctrl()
+    c._last_sent_current = 10
+    targets = []
+    for surplus in (7600, 7550, 7620, 7580, 7610, 7595):
+        t = c._smooth_current(surplus)
+        targets.append(t)
+        c._last_sent_current = t
+    assert set(targets) == {10}, f"prad ma stac na 10A przy szumie wokol granicy: {targets}"
+
+
+def test_current_rises_when_surplus_really_holds():
+    # Wygladzanie nie moze zablokowac realnego wzrostu — ma go tylko opoznic
+    c = make_ctrl()
+    c._last_sent_current = 10
+    out = []
+    for _ in range(3):
+        t = c._smooth_current(9000)
+        out.append(t)
+        c._last_sent_current = t
+    assert out[0] == 10, f"pierwsza probka jeszcze nie podnosi: {out}"
+    assert out[-1] > 10, f"po utrzymaniu nadwyzki prad ma wzrosnac: {out}"
+
+
+def test_small_current_drop_is_damped():
+    # Male redukcje wygladzamy — krotkie zejscie w magazyn jest akceptowalne
+    # (decyzja Tomka 2026-07-28), a rzadsze zmiany to spokojniejszy wallbox.
+    c = make_ctrl()
+    c._last_sent_current = 10
+    first = c._smooth_current(6300)          # ~9A, spadek o 1A
+    assert first == 10, f"pojedyncza probka nie obniza: {first}"
+    second = c._smooth_current(6300)
+    assert second == 9, f"po potwierdzeniu obniza: {second}"
+
+
+def test_large_current_drop_is_immediate():
+    # Nagly duzy pobor (pompa ciepla, piekarnik) — redukcja bez czekania,
+    # zeby nie przekroczyc przylacza 11 kW.
+    c = make_ctrl()
+    c._last_sent_current = 14
+    t = c._smooth_current(4200)              # ~6A, spadek o 8A
+    assert t <= 14 - ev.CURRENT_FAST_DROP_A, f"duzy spadek ma isc od razu, jest {t}"
+
+
+def test_real_log_sequence_has_fewer_changes():
+    # Realne nadwyzki z logow 2026-07-28 13:34-13:37 (te same, ktore dawaly
+    # 5 zmian pradu w 3 minuty). Wygladzanie ma ich wyraznie ubyc.
+    obs = [4757, 6600, 6670, 6803, 6993, 7710, 6907, 5097]
+    naive = [max(6, min(16, int(s / 690))) for s in obs]
+    naive_changes = sum(1 for a, b in zip(naive, naive[1:]) if a != b)
+
+    c = make_ctrl()
+    c._last_sent_current = 0
+    smoothed = []
+    for s in obs:
+        t = c._smooth_current(s)
+        smoothed.append(t)
+        c._last_sent_current = t
+    changes = sum(1 for a, b in zip(smoothed, smoothed[1:]) if a != b)
+
+    assert changes < naive_changes, \
+        f"wygladzanie ma zmniejszyc liczbe zmian: {changes} vs {naive_changes} " \
+        f"(smoothed={smoothed}, naive={naive})"
 
 
 def test_frozen_dp102_does_not_fake_deficit():

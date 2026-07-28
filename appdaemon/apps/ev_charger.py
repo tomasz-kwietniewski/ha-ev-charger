@@ -58,6 +58,21 @@ SURPLUS_BIAS_W = 1000
 # --- Uśrednianie nadwyżki (wygładzanie migotania PCC) ---
 PCC_HISTORY_SIZE = 3     # ile ostatnich odczytów uśredniać (3 * 30s = 90s)
 
+# --- Wygładzanie zmian prądu (ograniczenie "pikania" wallboxa) ---
+# Bez strefy nieczułości sterownik gonił szum: przy nadwyżce oscylującej wokół
+# granicy stopnia (1 A = 690 W) int() przerzucał cel tam i z powrotem —
+# zaobserwowane 2026-07-28: 10A -> 11A -> 10A w ciągu 60 sekund.
+# Drugi powód: auto dochodzi do zadanego prądu z opóźnieniem ~1 min, a jego
+# pobór wraca do wyliczenia nadwyżki. Pętla szybsza niż obiekt, którym steruje,
+# sama generuje oscylacje — dlatego zmianę trzeba potwierdzić przed wysłaniem.
+CURRENT_STEP_MARGIN_W = 250   # [W] histereza wokół progu stopnia (w obie strony)
+CURRENT_HOLD_ITERS    = 2     # ile iteracji nowy cel musi się utrzymać (2 x 30s)
+# Duży spadek idzie natychmiast — chroni przyłącze 11 kW, gdy nagle ruszy
+# pompa ciepła albo piekarnik. Małe redukcje wygładzamy: krótkie zejście
+# w magazyn domowy jest akceptowalne (decyzja Tomka, 2026-07-28), a rzadsze
+# zmiany oznaczają spokojniejszą ładowarkę.
+CURRENT_FAST_DROP_A   = 3     # [A] spadek o tyle lub więcej -> bez czekania
+
 # --- Ponowienia komendy switch (START/STOP) ---
 # Dedup po _last_sent_switch chroni przed spamem (Problem 13), ale bez
 # ponowień jedna zgubiona/nieskuteczna komenda blokowała sterowanie na stałe.
@@ -146,6 +161,8 @@ class EVChargerControl(hass.Hass):
         self._session_start_time  = None
         self._device_error_count  = 0
         self._last_sent_current   = -1
+        self._pending_current     = -1   # cel oczekujący na potwierdzenie
+        self._pending_iters       = 0    # ile iteracji już się utrzymuje
         self._last_sent_switch    = None
         self._switch_mismatch_iters = 0   # iteracje niezgodności stan vs wysłana komenda
         self._start_retries         = 0   # ile razy ponowiono START w bieżącym podejściu
@@ -458,20 +475,70 @@ class EVChargerControl(hass.Hass):
                 self.log(f"SOLAR->IDLE: nadwyzka={available_surplus:.0f}W < {STOP_SURPLUS_W}W")
                 return ("IDLE", 0)
             else:
-                target = self._surplus_to_current(available_surplus)
+                target = self._smooth_current(available_surplus)
                 self.log(f"SOLAR: reguluję do {target}A")
                 return ("SOLAR", target)
         else:
             if available_surplus >= START_SURPLUS_W:
+                # Start sesji — bez wygładzania, bierzemy pełną dostępną moc
+                self._pending_current, self._pending_iters = -1, 0
                 target = self._surplus_to_current(available_surplus)
                 self.log(f"SOLAR: startuję {target}A (nadwyzka={available_surplus:.0f}W)")
                 return ("SOLAR", target)
             else:
                 return ("IDLE", 0)
 
-    def _surplus_to_current(self, surplus_w):
-        current = surplus_w / (PHASES * VOLTAGE)
-        return max(MIN_CURRENT_A, min(MAX_CURRENT_A, int(current)))
+    def _surplus_to_current(self, surplus_w, last_a=None):
+        """Nadwyżka [W] -> prąd [A], opcjonalnie z histerezą wokół progu stopnia.
+
+        Bez `last_a` to gołe przeliczenie (używane przy starcie sesji).
+        Z `last_a` dokładamy strefę nieczułości ±CURRENT_STEP_MARGIN_W: żeby
+        podnieść prąd, nadwyżka musi przekroczyć próg stopnia z zapasem, i tak
+        samo w dół. To zabija przeskoki 10 -> 11 -> 10 przy nadwyżce stojącej
+        dokładnie na granicy.
+        """
+        def step(w):
+            return max(MIN_CURRENT_A, min(MAX_CURRENT_A, int(w / (PHASES * VOLTAGE))))
+
+        if last_a is None or last_a <= 0:
+            return step(surplus_w)
+        up   = step(surplus_w - CURRENT_STEP_MARGIN_W)   # w górę trudniej
+        down = step(surplus_w + CURRENT_STEP_MARGIN_W)   # w dół też trudniej
+        if up > last_a:
+            return up
+        if down < last_a:
+            return down
+        return last_a                                     # wewnątrz strefy nieczułości
+
+    def _smooth_current(self, surplus_w):
+        """Wygładzony cel prądu: histereza + potwierdzenie zmiany w czasie.
+
+        Zmianę wysyłamy dopiero, gdy nowy cel utrzyma się CURRENT_HOLD_ITERS
+        iteracji z rzędu. Wyjątek: spadek o CURRENT_FAST_DROP_A lub więcej idzie
+        natychmiast, bo chroni przyłącze przed przekroczeniem mocy.
+        """
+        last = self._last_sent_current
+        raw  = self._surplus_to_current(surplus_w, last)
+
+        if last <= 0:                      # start sesji — bez wygładzania
+            self._pending_current, self._pending_iters = raw, 0
+            return raw
+        if raw == last:                    # nic się nie zmienia
+            self._pending_current, self._pending_iters = last, 0
+            return last
+        if last - raw >= CURRENT_FAST_DROP_A:
+            self._pending_current, self._pending_iters = raw, 0
+            self.log(f"Prad: szybka redukcja {last}A -> {raw}A (ochrona przylacza)")
+            return raw
+
+        if raw == self._pending_current:
+            self._pending_iters += 1
+        else:
+            self._pending_current, self._pending_iters = raw, 1
+        if self._pending_iters >= CURRENT_HOLD_ITERS:
+            self._pending_iters = 0
+            return raw
+        return last                        # jeszcze nie potwierdzone
 
     # ------------------------------------------------------------------
     # WYKONANIE DECYZJI
@@ -547,6 +614,8 @@ class EVChargerControl(hass.Hass):
                                 level="ERROR")
                 self._charger_active     = False
                 self._session_start_time = None
+                # Sesja zamknięta — nie przenoś oczekującej zmiany prądu na następną
+                self._pending_current, self._pending_iters = -1, 0
             else:
                 if self._charger_active:
                     self._charger_active = False

@@ -146,9 +146,14 @@ PCC_HISTORY_SIZE  = 3    # ile odczytów uśredniać (3 * 30s = 90s)
 WATCHDOG_FROZEN_DP_THRESHOLD = 20  # iteracji WORKING+0W zanim watchdog ostrzeże (=10 min)
 SWITCH_RETRY_ITERATIONS  = 4  # co ile iteracji ponawiać START/STOP przy niezgodności stanu
 SWITCH_MAX_START_RETRIES = 3  # ile razy ponawiać START zanim skrypt odpuści (auto pełne?)
+CURRENT_STEP_MARGIN_W = 250   # [W] histereza wokół progu stopnia prądu (w obie strony)
+CURRENT_HOLD_ITERS    = 2     # ile iteracji nowy cel musi się utrzymać przed wysłaniem
+CURRENT_FAST_DROP_A   = 3     # [A] spadek o tyle lub więcej idzie natychmiast (ochrona przyłącza)
 ```
 
 Nadwyżka dla trybu SOLAR to `min(eksport PCC, PV − zużycie domu) + pobór ładowarki`, uśredniona przez 3 odczyty i powiększona o `SURPLUS_BIAS_W`. Samo PCC nie wystarcza, bo falownik hybrydowy w trybie self-use trzyma PCC blisko zera rozładowując magazyn i deficyt byłby niewidoczny (skrypt podkręcałby prąd kosztem baterii domowej). Przy imporcie nadwyżka jest ujemna (bez podłogi), dzięki czemu regulacja redukuje prąd i histereza STOP faktycznie działa. Pobór ładowarki doliczany jest **przed** uśrednianiem — inaczej średnia miesza próbki mierzone przy różnej mocy ładowania i prąd skacze tuż po starcie sesji (szczegóły: docs, Problem 19).
+
+Sam prąd jest dodatkowo **wygładzany**, żeby ładowarka nie zmieniała nastawy co 30 sekund: histereza ±250 W wokół progu stopnia plus wymóg, by nowy cel utrzymał się przez 2 iteracje. Spadek o 3 A lub więcej idzie natychmiast, bo chroni przyłącze 11 kW. Bez tego wystarczało wahanie ±30 W przy nadwyżce stojącej na granicy stopnia, żeby prąd skakał w każdej iteracji (szczegóły: docs, Problem 23).
 
 ## Struktura plików
 

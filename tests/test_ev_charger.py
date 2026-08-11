@@ -542,6 +542,18 @@ def test_freeze_survives_mode_flapping():
         "migotanie trybu nie moze kasowac wykrycia zawieszenia"
 
 
+def test_freeze_not_reported_right_after_long_idle():
+    # Auto stoi podpiete cala noc albo czeka na slonce w stanie PAUSE — prad
+    # nie plynie, wiec DP 102 moze sie nie zmieniac i nic to nie znaczy.
+    # Po powrocie nadwyzki licznik ma ruszyc od zera i dac wallboxowi pelne
+    # okno obserwacji, zamiast krzyczec o awarii w pierwszej iteracji.
+    c = make_ctrl()
+    _pump_health(c, 40, mode="IDLE", status="PAUSE")
+    c._update_health(charger("WORKING", metrics_raw=FROZEN_RAW), "SOLAR")
+    assert not c._is_charger_frozen(), \
+        "po dlugim postoju licznik ma ruszyc od zera, nie alarmowac natychmiast"
+
+
 def test_freeze_notifies_once_and_dismisses_on_recovery():
     # 36 h ciszy bylo glownym kosztem tej awarii — ma powstac powiadomienie
     # w HA, dokladnie jedno na epizod, i ma zniknac po powrocie do pracy.

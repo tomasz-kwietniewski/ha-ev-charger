@@ -149,6 +149,13 @@ SWITCH_MAX_START_RETRIES = 3  # ile razy ponawiać START zanim skrypt odpuści (
 CURRENT_STEP_MARGIN_W = 250   # [W] histereza wokół progu stopnia prądu (w obie strony)
 CURRENT_HOLD_ITERS    = 2     # ile iteracji nowy cel musi się utrzymać przed wysłaniem
 CURRENT_FAST_DROP_A   = 3     # [A] spadek o tyle lub więcej idzie natychmiast (ochrona przyłącza)
+CURRENT_VERIFY_ITERS  = 2     # ile iteracji tolerancji, zanim uznamy że prąd się nie przyjął
+FROZEN_METRICS_THRESHOLD   = 10  # identycznych odczytów DP 102 = zawieszony wallbox (=5 min)
+HEALTH_ACTIVE_GRACE_ITERS  = 6   # okno tolerancji migotania trybu przy wykrywaniu awarii
+UNRESPONSIVE_CMD_THRESHOLD = 4   # ile komend bez efektu zanim powiadomimy o awarii
+START_RETRY_COOLDOWN_ITERS = 60  # pauza po serii nieudanych STARTów (=30 min), potem próba znowu
+WAKE_CYCLE_AFTER_ITERS     = 30  # WORKING bez poboru przez 15 min -> cykl budzenia sesji
+WAKE_CYCLE_MAX_ATTEMPTS    = 2   # twardy limit budzeń (każdy STOP to cykl stycznika)
 ```
 
 Nadwyżka dla trybu SOLAR to `min(eksport PCC, PV − zużycie domu) + pobór ładowarki`, uśredniona przez 3 odczyty i powiększona o `SURPLUS_BIAS_W`. Samo PCC nie wystarcza, bo falownik hybrydowy w trybie self-use trzyma PCC blisko zera rozładowując magazyn i deficyt byłby niewidoczny (skrypt podkręcałby prąd kosztem baterii domowej). Przy imporcie nadwyżka jest ujemna (bez podłogi), dzięki czemu regulacja redukuje prąd i histereza STOP faktycznie działa. Pobór ładowarki doliczany jest **przed** uśrednianiem — inaczej średnia miesza próbki mierzone przy różnej mocy ładowania i prąd skacze tuż po starcie sesji (szczegóły: docs, Problem 19).
@@ -193,7 +200,11 @@ ha-ev-charger/
 - **Samo PCC nie wystarcza do regulacji** — falownik hybrydowy w trybie self-use kompensuje deficyt z magazynu, trzymając PCC blisko zera; nadwyżkę liczymy jako `min(PCC, PV − dom)`, inaczej regulacja podkręca prąd kosztem baterii domowej
 - **Dedup komend wymaga ponowień** — zapamiętywanie ostatnio wysłanego START/STOP chroni przed spamem, ale bez retry jedna zgubiona komenda blokuje sterowanie na stałe (patrz Problem 19)
 - **Moc DP 102 × 100** — wartości mocy per faza są mnożone przez 100, `32` oznacza 3200W
-- **DP 102 potrafi się „zamrozić"** — firmware dé EV Charger v2.9.4 czasami przestaje aktualizować cały blok pomiarów (L1/L2/L3 + pola `p`/`e`/`t`); status nadal `WORKING`, ale moc zwracana to 0 W mimo realnego ładowania. Lekarstwo: **Reboot z aplikacji Smart Life** (Settings → Reboot, nie Reset to Factory). Skrypt ma watchdog ostrzegający w logach po 10 min utrzymującego się WORKING+0W w aktywnym trybie ładowania.
+- **DP 102 potrafi się „zamrozić"** — firmware dé EV Charger v2.9.4 czasami przestaje aktualizować cały blok pomiarów (L1/L2/L3 + pola `p`/`e`/`t`); status nadal `WORKING`, ale moc zwracana to 0 W mimo realnego ładowania. Lekarstwo: **Reboot z aplikacji Smart Life** (Settings → Reboot, nie Reset to Factory).
+- **Ten sam firmware potrafi zawiesić się głębiej** — urządzenie odpowiada w sieci (ping OK, TinyTuya czyta bez błędu), ale zamrożone są też status DP 109 i wykonywanie komend DP 140: ani START, ani STOP nie robią nic. Trwało to 36 godzin (2026-08-10/11). Sygnatura rozstrzygająca: **surowy DP 102 identyczny co do bitu w kolejnych odczytach** — realne napięcie sieci i temperatura zawsze drgają, a trzy fazy nigdy nie mają tej samej wartości. Skrypt wykrywa to po 5 minutach i tworzy powiadomienie w HA (patrz Problem 24)
+- **Status `WORKING` to deklaracja, nie fakt** — znaczy tylko tyle, że wallbox ma otwartą sesję, nie że auto pobiera prąd. Nie używać go jako jedynego dowodu, że ładowanie trwa; konfrontować ze świeżością danych, sprzężeniem zwrotnym z komend (DP 150) i realnym przepływem mocy
+- **Auto po STOP-ie zamyka sesję i samo jej nie wznawia** — Stellantis (Citroën Spacetourer) wyświetla wtedy „ładowanie zakończone" i czeka na nową negocjację; przy wallboxie tkwiącym w `WORKING` trzeba wymusić cykl STOP → START, żeby przerwać sygnał na Control Pilot
+- **DP 107 = `[6, 8, 10, 13, 16]`** — lista poziomów prądu; nierozstrzygnięte, czy to realne ograniczenie API, czy tylko presety w Smart Life. Skrypt zadaje dowolne 6-16 A, a `_verify_current` zaloguje WARNING, jeśli wallbox nie przyjmie wartości spoza tej listy
 - **DP 102 ma ukryte pole `e` = energia sesji × 0,1 kWh** — niezależny od naszego liczenia `power × dt`, można użyć jako kontrolny licznik energii sesji
 - **DP 105 = historia ostatniej sesji** — JSON z `t` (timestamp), `s/e` (start/end), `d` (duration), `c` (kWh × 10); aktualizowany przez wallbox po zakończeniu sesji
 - **DP 151 a chmura Tuya** — wallbox po reboocie potrafi pobrać z chmury Tuya niezerowy harmonogram (`m:0` znaczy nieaktywny); skrypt czyści przy starcie sesji, dla bezpieczeństwa też przy każdym `initialize()` AppDaemona
@@ -224,7 +235,9 @@ Lekki runner bez zewnętrznych zależności (stubuje AppDaemon, TinyTuya i `requ
 python tests/test_ev_charger.py
 ```
 
-Pokrywa logikę decyzyjną (`_decide`, `_surplus_to_current`), liczenie nadwyżki przy deficycie i maskowaniu przez magazyn, ponowienia komend START/STOP, detekcję błędów TinyTuya, atomowość persystencji i limit 255 znaków `input_text.ev_data`. Warto uruchomić przed każdym `./deploy.sh`.
+Pokrywa logikę decyzyjną (`_decide`, `_surplus_to_current`), liczenie nadwyżki przy deficycie i maskowaniu przez magazyn, ponowienia komend START/STOP, detekcję błędów TinyTuya, atomowość persystencji, limit 255 znaków `input_text.ev_data`, a także wykrywanie zawieszonego wallboxa, cykl budzenia sesji i weryfikację zadanego prądu. `./deploy.sh` uruchamia je automatycznie i przerywa wdrożenie, gdy któryś nie przejdzie.
+
+Każdy test regresyjny nosi w komentarzu datę i opis zdarzenia, które go wymusiło — dzięki temu widać, przed czym konkretnie chroni dana asercja.
 
 ## Konfiguracja środowiskowa
 
@@ -249,6 +262,18 @@ ha apps logs a0d7b954_appdaemon
 ```
 
 > **Uwaga:** AppDaemon loguje przez supervisor HA, **nie** do pliku `.log` na dysku. Komenda powyżej to jedyna pewna droga do logów.
+
+Domyślnie zwracane jest tylko ostatnie ~100 linii — do analizy historii trzeba podać `-n`:
+
+```bash
+ha apps logs a0d7b954_appdaemon -n 3000
+```
+
+Gdy ładowanie nie rusza mimo nadwyżki, najszybszy test to sprawdzenie, czy pomiary wallboxa **w ogóle się zmieniają**. Jeśli wszystkie odczyty są identyczne co do bitu, urządzenie jest zawieszone i żadna zmiana w skrypcie nie pomoże — potrzebny jest Reboot ze Smart Life:
+
+```bash
+ha apps logs a0d7b954_appdaemon -n 20000 | grep -oE "DP102_raw=.*" | sort | uniq -c
+```
 
 ## Licencja
 

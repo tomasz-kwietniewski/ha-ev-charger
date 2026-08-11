@@ -72,6 +72,20 @@ CURRENT_HOLD_ITERS    = 2     # ile iteracji nowy cel musi się utrzymać (2 x 3
 # w magazyn domowy jest akceptowalne (decyzja Tomka, 2026-07-28), a rzadsze
 # zmiany oznaczają spokojniejszą ładowarkę.
 CURRENT_FAST_DROP_A   = 3     # [A] spadek o tyle lub więcej -> bez czekania
+# Weryfikacja sprzężenia zwrotnego: DP 150 mówi, jaki prąd wallbox faktycznie
+# ma ustawiony. Bez porównania z tym, co wysłaliśmy, komenda do zawieszonego
+# urządzenia wygląda jak sukces (set_value nie rzuca wyjątkiem). 2 iteracje
+# tolerancji, bo wallbox raportuje nową wartość z opóźnieniem.
+CURRENT_VERIFY_ITERS  = 2
+
+# Ile razy czyścić harmonogram DP 151 wpychany przez chmurę Tuya, zanim
+# odpuścimy. Limit chroni przed ping-pongiem komend co 30 s, gdyby chmura
+# uparcie wracała ze swoim ustawieniem.
+SCHEDULE_CLEAR_MAX    = 5
+# Po tylu iteracjach z czystym harmonogramem uznajemy sprawę za załatwioną
+# i licznik czyszczeń rusza od zera — inaczej jedno wpychanie dziennie
+# wyczerpałoby limit po kilku dniach pracy AppDaemona.
+SCHEDULE_CLEAR_RESET_ITERS = 20
 
 # --- Ponowienia komendy switch (START/STOP) ---
 # Dedup po _last_sent_switch chroni przed spamem (Problem 13), ale bez
@@ -81,6 +95,20 @@ SWITCH_MAX_START_RETRIES = 3   # ile razy ponawiać START zanim odpuścimy (auto
 # STOP ponawiamy dłużej (ochrona magazynu), ale też z limitem — każdy STOP to
 # cykl stycznika wallboxa, a wieczne klikanie było oryginalnym Problemem 13.
 SWITCH_MAX_STOP_RETRIES  = 5   # 5 x 2 min = 10 minut prób, potem głośny ERROR
+# Odpuszczenie prób STARTu nie może być wieczne. 2026-08-10: po trzech
+# nieudanych próbach skrypt zamilkł na resztę dnia, choć nadwyżka sięgała
+# 8,6 kW. Reset licznika był osiągalny wyłącznie przez gałąź nieaktywnego
+# trybu, w którą przy trwałej nadwyżce w ogóle się nie wchodzi.
+START_RETRY_COOLDOWN_ITERS = 60   # 30 min ciszy, potem kolejna seria prób
+
+# --- Budzenie sesji, gdy wallbox pracuje, a auto nie pobiera ---
+# Status WORKING mówi tylko tyle, że wallbox ma otwartą sesję — nie że auto
+# bierze prąd. Gdy auto zaśnie (Stellantis po STOPie zamyka sesję i sam jej
+# nie wznawia), warunek `not charger_working` nigdy nie jest prawdziwy, więc
+# skrypt nie ma jak wysłać STARTu. Jedyne wyjście to cykl STOP -> START, który
+# przerywa sygnał na Control Pilot i zmusza auto do nowej negocjacji.
+WAKE_CYCLE_AFTER_ITERS  = 30   # 15 min WORKING+0W przy aktywnej chęci ładowania
+WAKE_CYCLE_MAX_ATTEMPTS = 2    # twardy limit — każdy STOP to cykl stycznika (Problem 13)
 
 # --- Cena energii ---
 NEGATIVE_PRICE_THRESHOLD = 0.0
@@ -99,6 +127,32 @@ WATCHDOG_FROZEN_DP_THRESHOLD = 20  # 20 × 30s = 10 minut
 # watchdogowi dojść do progu i ostrzec). 2 iteracje = 1 min, czyli więcej niż
 # normalna chwila negocjacji auto-wallbox tuż po starcie.
 FROZEN_DP_FALLBACK_ITERS = 2
+
+# --- Wykrywanie zawieszenia wallboxa (awaria 2026-08-11) ---
+# Firmware dé EV potrafi zawiesić się tak, że urządzenie odpowiada w sieci
+# (ping OK, tinytuya czyta bez błędu), ale nie aktualizuje DPS i nie wykonuje
+# ŻADNYCH komend — ani START, ani STOP. Trwało to 36 godzin, bo skrypt patrzył
+# wyłącznie na power_w == 0, co wygląda identycznie jak auto, które legalnie
+# nie pobiera. Sygnatura rozstrzygająca leżała w danych przez cały czas:
+# DP 102 identyczny CO DO BITU w kolejnych odczytach. Realne napięcie sieci
+# i temperatura obudowy zawsze drgają, a trzy fazy nigdy nie mają dokładnie
+# tej samej wartości — zamrożona próbka z awarii to
+# {"L1":[2430,0,0],"L2":[2430,0,0],"L3":[2430,0,0],"t":330,...} przez 36 h.
+FROZEN_METRICS_THRESHOLD = 10   # 10 × 30 s = 5 min bez zmiany DP 102
+# Alarmujemy tylko gdy skrypt w ogóle chce ładować — inaczej spokojny postój
+# (auto odpięte, noc) wyglądałby jak awaria. To OKNO tolerancji, nie warunek
+# "tryb aktywny w tej iteracji": nadwyżka stojąca na granicy progu przerzuca
+# tryb SOLAR/IDLE co kilka iteracji i twardy warunek kasowałby wykrycie
+# (2026-08-11 12:27: licznik wyzerował się przy stanie 40).
+HEALTH_ACTIVE_GRACE_ITERS = 6   # 3 min od ostatniej chęci ładowania
+# Komendy bez efektu — wspólny licznik dla START i STOP. Osobne liczniki nie
+# łączyły kropek: wallbox ignorował START (2026-08-10) i STOP (2026-08-11),
+# a każdy licznik z osobna mieścił się w swoim limicie i milkł.
+UNRESPONSIVE_CMD_THRESHOLD = 4
+HEALTH_NOTIFY_ID = "ev_charger_awaria"
+
+# Tryby, w których skrypt świadomie chce ładować.
+ACTIVE_CHARGING_MODES = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
 
 # --- Tryb zimowy ---
 WINTER_MODE_ENTITY  = "input_boolean.ev_tryb_zimowy"
@@ -144,8 +198,13 @@ CHARGER_WORKING_STATES = {"WORKING"}
 
 class EVChargerControl(hass.Hass):
 
-    def initialize(self):
-        self.log("EV Charger Control startuje...")
+    def _init_runtime_state(self):
+        """Cały stan runtime w jednym miejscu.
+
+        Wydzielone z initialize(), żeby testy jednostkowe startowały z dokładnie
+        tym samym stanem co żywy HA — wcześniej testy powielały tę listę ręcznie
+        i rozjeżdżały się z produkcją przy każdym nowym polu.
+        """
         self._charger_active      = False
         self._current_session_kwh = 0.0
         self._month_energy_kwh    = self._load_persistent("ev_month_energy_kwh", 0.0)
@@ -167,11 +226,27 @@ class EVChargerControl(hass.Hass):
         self._switch_mismatch_iters = 0   # iteracje niezgodności stan vs wysłana komenda
         self._start_retries         = 0   # ile razy ponowiono START w bieżącym podejściu
         self._stop_retries          = 0   # jw. dla STOP
+        self._start_giveup_iters    = 0   # ile iteracji trwa cooldown po odpuszczeniu
+        self._wake_attempts         = 0   # cykle budzenia w bieżącej sesji
+        self._last_charger_status   = None
+        self._current_mismatch_iters = 0  # iteracje niezgodności DP 150 vs wysłany prąd
+        self._schedule_clears       = 0   # ile razy czyściliśmy wepchnięty harmonogram
+        self._iters_schedule_empty  = 0
         self._emergency_end_time  = None
         self._surplus_history         = []
         # --- DIAG bug 2: śledzenie czy wallbox tkwi w WORKING+0W i czy DP 151 się zmienia ---
         self._working_zero_power_streak = 0
         self._last_schedule_seen        = None
+        # --- Zdrowie wallboxa (awaria 2026-08-11) ---
+        self._last_metrics_raw       = None
+        self._frozen_metrics_streak  = 0
+        self._iters_since_active_mode = HEALTH_ACTIVE_GRACE_ITERS + 1
+        self._unresponsive_cmds      = 0
+        self._health_notified        = False
+
+    def initialize(self):
+        self.log("EV Charger Control startuje...")
+        self._init_runtime_state()
 
         # Odtwórz sensor historii z trwałego pliku (po restarcie HA/AppDaemon)
         self._publish_history()
@@ -250,6 +325,7 @@ class EVChargerControl(hass.Hass):
         mode, target_current = self._decide(ha_data, charger_data)
         self._apply_decision(mode, target_current, charger_data)
         self._update_diag(charger_data, mode)
+        self._update_health(charger_data, mode)
         self._update_sensors(charger_data, ha_data, mode, target_current)
         self._update_ha_helpers(charger_data, ha_data, mode, target_current)
 
@@ -258,38 +334,34 @@ class EVChargerControl(hass.Hass):
     # ------------------------------------------------------------------
 
     def _update_diag(self, charger_data, mode):
-        """Watchdog na zamrożenie pomiaru DP 102 + detekcja zmian DP 151.
+        """Streak WORKING+0W (zasila fallback kompensacji) + ślad zmian DP 151.
 
-        Bug poznawczy z 2026-05-21: firmware dé EV Charger v2.9.4 potrafi
-        "zamrozić" DP 102 (cały blok pomiarów L1/L2/L3/p/e/t) na wiele
-        godzin — wallbox raportuje WORKING + moc 0W mimo realnego ładowania.
-        Soft Reboot z aplikacji Smart Life naprawia. Skrypt nie wykrywa
-        problemu sam, ale ten watchdog ostrzeże w logach gdy WORKING+0W
-        utrzymuje się długo w aktywnym trybie ładowania.
+        Streak celowo NIE zależy od trybu. Wcześniej liczył się tylko w trybie
+        aktywnym i każde zejście do IDLE zerowało go — przy nadwyżce stojącej
+        na granicy progu tryb przerzuca się co kilka iteracji, więc licznik
+        gubił się w połowie (2026-08-11 12:27: reset przy stanie 40). Traciły
+        na tym dwie rzeczy naraz: wykrywanie awarii i fallback kompensacji,
+        który bez streaka przestawał podstawiać ostatnią znaną moc i skrypt
+        STOPował realnie trwającą sesję.
         """
-        # Streak tylko gdy skrypt świadomie chce ładować (nie liczymy
-        # przerw IDLE/BATTERY_PRIORITY, gdzie 0W jest oczekiwane).
-        active_charging_modes = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
-        in_active_mode = mode in active_charging_modes
         worker_no_power = (charger_data["status"] in CHARGER_WORKING_STATES
                            and charger_data["power_w"] == 0)
 
-        if in_active_mode and worker_no_power:
+        if worker_no_power:
             self._working_zero_power_streak += 1
-            # Watchdog WARNING — uderza raz, dokładnie przy przekroczeniu progu.
             if self._working_zero_power_streak == WATCHDOG_FROZEN_DP_THRESHOLD:
+                # Sam fakt braku poboru nie jest jeszcze diagnozą — auto może
+                # być pełne. Rozstrzyga _update_health() po zawartości DP 102.
                 self.log(
-                    f"WATCHDOG: WORKING+0W w trybie {mode} przez "
-                    f"{WATCHDOG_FROZEN_DP_THRESHOLD * UPDATE_INTERVAL_S}s. "
-                    f"Prawdopodobne zamrożenie DP 102 w wallboxie — "
-                    f"sprobuj Reboot z Smart Life. "
-                    f"DP102_raw={charger_data.get('metrics_raw')!r}",
+                    f"Brak poboru mimo statusu WORKING przez "
+                    f"{WATCHDOG_FROZEN_DP_THRESHOLD * UPDATE_INTERVAL_S}s "
+                    f"(tryb {mode}). DP102_raw={charger_data.get('metrics_raw')!r}",
                     level="WARNING"
                 )
         else:
             if self._working_zero_power_streak >= WATCHDOG_FROZEN_DP_THRESHOLD:
                 self.log(
-                    f"WATCHDOG: koniec WORKING+0W "
+                    f"Koniec WORKING+0W "
                     f"({self._working_zero_power_streak} iteracji)"
                 )
             self._working_zero_power_streak = 0
@@ -304,6 +376,129 @@ class EVChargerControl(hass.Hass):
                 f"DIAG: DP151 zmiana: {self._last_schedule_seen!r} -> {schedule_now!r}"
             )
             self._last_schedule_seen = schedule_now
+
+        # Chmura Tuya wpycha harmonogram po każdym reboocie wallboxa
+        # (2026-05-21 i 2026-08-11: "ss":"15:00","se":"17:00"). Dotąd czyściliśmy
+        # DP 151 tylko w initialize() i _send_start(), więc gdy wallbox siedział
+        # w WORKING, harmonogram zostawał i mógł wprowadzić PAUSE o swojej porze.
+        if self._schedule_is_set(schedule_now):
+            self._iters_schedule_empty = 0
+            if self._schedule_clears < SCHEDULE_CLEAR_MAX:
+                self._schedule_clears += 1
+                self.log(
+                    f"Chmura Tuya wepchnela harmonogram {schedule_now!r} — czyszcze "
+                    f"({self._schedule_clears}/{SCHEDULE_CLEAR_MAX})", level="WARNING")
+                self._clear_schedule()
+            elif self._schedule_clears == SCHEDULE_CLEAR_MAX:
+                self._schedule_clears += 1   # żeby zalogować tylko raz
+                self.log(
+                    "Harmonogram wraca mimo czyszczenia — przestaje probowac. "
+                    "Sprawdz ustawienia ladowarki w Smart Life.", level="ERROR")
+        else:
+            self._iters_schedule_empty += 1
+            if self._iters_schedule_empty >= SCHEDULE_CLEAR_RESET_ITERS:
+                self._schedule_clears = 0
+
+    @staticmethod
+    def _schedule_is_set(schedule_raw):
+        """Czy DP 151 zawiera realny harmonogram (a nie nasz wyczyszczony wzorzec)."""
+        if not schedule_raw:
+            return False
+        try:
+            s = (json.loads(schedule_raw) if isinstance(schedule_raw, str)
+                 else schedule_raw)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(s, dict):
+            return False
+        return (bool(s.get("m"))
+                or s.get("ss", "00:00") != "00:00"
+                or s.get("se", "00:00") != "00:00")
+
+    def _update_health(self, charger_data, mode):
+        """Czy wallbox w ogóle żyje — i powiadomienie, gdy nie.
+
+        Awaria 2026-08-10/11 trwała 36 godzin, bo jedyną reakcją na zawieszony
+        wallbox był WARNING w logu, którego nikt nie czyta. Tu wykrywamy dwie
+        niezależne sygnatury i mówimy o nich człowiekowi:
+
+        1. Zamrożony DP 102 — identyczny co do bitu przez FROZEN_METRICS_THRESHOLD
+           odczytów. Realny pomiar tak nie wygląda.
+        2. Komendy bez efektu — wallbox potwierdza wysyłkę, ale status się nie
+           zmienia, niezależnie czy prosimy o START czy o STOP.
+        """
+        if mode in ACTIVE_CHARGING_MODES:
+            self._iters_since_active_mode = 0
+        else:
+            self._iters_since_active_mode += 1
+
+        # Offline ma własną obsługę (_get_charger_data) — nie mieszamy zamrożenia
+        # z brakiem łączności, bo lekarstwo jest inne.
+        raw = charger_data.get("metrics_raw")
+        if charger_data["online"] and raw:
+            if raw == self._last_metrics_raw:
+                self._frozen_metrics_streak += 1
+            else:
+                # Ten odczyt otwiera nową serię, więc 1 a nie 0 — streak liczy
+                # odczyty, nie porównania.
+                self._frozen_metrics_streak = 1
+                self._last_metrics_raw = raw
+
+        frozen       = self._is_charger_frozen()
+        unresponsive = self._unresponsive_cmds >= UNRESPONSIVE_CMD_THRESHOLD
+
+        if (frozen or unresponsive) and not self._health_notified:
+            self._health_notified = True
+            powody = []
+            if frozen:
+                powody.append(
+                    f"pomiar DP 102 nie zmienił się od "
+                    f"{(self._frozen_metrics_streak - 1) * UPDATE_INTERVAL_S // 60} min"
+                )
+            if unresponsive:
+                powody.append(
+                    f"{self._unresponsive_cmds} komend bez efektu "
+                    f"(status trzyma się na {charger_data['status']})"
+                )
+            tekst = (
+                "Ładowarka nie reaguje: " + ", ".join(powody) + ". "
+                "Nadwyżka PV idzie do sieci zamiast do auta. "
+                "Lekarstwo: Smart Life -> ładowarka -> Settings -> Reboot "
+                "(NIE Reset to Factory)."
+            )
+            self.log(f"AWARIA WALLBOXA: {tekst} "
+                     f"DP102_raw={raw!r}", level="ERROR")
+            self._notify_problem(tekst)
+        elif self._health_notified and not frozen and not unresponsive:
+            self._health_notified = False
+            self.log("Wallbox wrócił do pracy — kasuję powiadomienie o awarii")
+            self._dismiss_problem()
+
+    def _is_charger_frozen(self):
+        """Zamrożony wallbox: DP 102 stoi, a my w ostatnich minutach chcieliśmy ładować.
+
+        Drugi warunek odsiewa spokojny postój (auto odpięte, noc) — wtedy stały
+        DP 102 niczego złego nie oznacza. Okno HEALTH_ACTIVE_GRACE_ITERS zamiast
+        "tryb aktywny teraz", bo tryb potrafi migotać przy nadwyżce na granicy.
+        """
+        return (self._frozen_metrics_streak >= FROZEN_METRICS_THRESHOLD
+                and self._iters_since_active_mode <= HEALTH_ACTIVE_GRACE_ITERS)
+
+    def _notify_problem(self, message):
+        try:
+            self.call_service("persistent_notification/create",
+                              title="EV: ładowarka nie reaguje",
+                              message=message,
+                              notification_id=HEALTH_NOTIFY_ID)
+        except Exception as e:
+            self.log(f"Blad wysylki powiadomienia: {e}", level="WARNING")
+
+    def _dismiss_problem(self):
+        try:
+            self.call_service("persistent_notification/dismiss",
+                              notification_id=HEALTH_NOTIFY_ID)
+        except Exception as e:
+            self.log(f"Blad kasowania powiadomienia: {e}", level="WARNING")
 
     # ------------------------------------------------------------------
     # ODCZYT DANYCH
@@ -548,22 +743,53 @@ class EVChargerControl(hass.Hass):
         charger_status  = charger_data["status"]
         charger_working = charger_status in CHARGER_WORKING_STATES
 
-        if mode in ("NEGATIVE_PRICE", "SOLAR", "WINTER_NIGHT", "EMERGENCY"):
+        # Zmiana statusu to zmiana warunków (przepięty kabel, wallbox wrócił
+        # po reboocie) — liczniki prób ruszają od nowa. _last_sent_switch
+        # celowo zostaje: wallbox przeskakuje SLEEP/IDLE całymi blokami i
+        # kasowanie go przy każdym przeskoku dałoby lawinę komend.
+        if charger_status != self._last_charger_status:
+            if self._last_charger_status is not None:
+                self._start_retries         = 0
+                self._stop_retries          = 0
+                self._start_giveup_iters    = 0
+                self._switch_mismatch_iters = 0
+            self._last_charger_status = charger_status
+
+        if mode in ACTIVE_CHARGING_MODES:
             if target_current > 0 and target_current != self._last_sent_current:
                 # _last_sent_current tylko przy sukcesie — porażka wysyłki
                 # zostawia różnicę wartości, więc ponowienie wyjdzie za 30 s.
                 if self._set_current(target_current):
-                    self._last_sent_current = target_current
+                    self._last_sent_current      = target_current
+                    self._current_mismatch_iters = 0
+            else:
+                self._verify_current(charger_data)
             if not charger_working:
                 if self._last_sent_switch is not True:
                     # Pierwsza próba (albo ponowienie po nieudanej wysyłce).
                     self._send_start()
+                elif self._start_retries > SWITCH_MAX_START_RETRIES:
+                    # Odpuszczone — ale tylko na czas cooldownu. Warunki mogą
+                    # się zmienić same (auto się obudzi, wallbox wróci), więc
+                    # po przerwie wracamy do prób zamiast milczeć do wieczora.
+                    self._start_giveup_iters += 1
+                    if self._start_giveup_iters >= START_RETRY_COOLDOWN_ITERS:
+                        self._start_giveup_iters    = 0
+                        self._start_retries         = 0
+                        self._switch_mismatch_iters = 0
+                        self.log(
+                            f"Cooldown {START_RETRY_COOLDOWN_ITERS * UPDATE_INTERVAL_S // 60} "
+                            f"min minal — wracam do prob STARTu")
                 else:
                     # START poszedł, ale wallbox wciąż nie ładuje — ponów
                     # z backoffem, z limitem prób (auto może być po prostu pełne).
                     self._switch_mismatch_iters += 1
                     if self._switch_mismatch_iters >= SWITCH_RETRY_ITERATIONS:
                         self._switch_mismatch_iters = 0
+                        # Liczymy niezależnie od tego, czy jeszcze ponawiamy —
+                        # po wyczerpaniu limitu wallbox dalej nie reaguje i to
+                        # jest właśnie sygnał, który ma dotrzeć do człowieka.
+                        self._unresponsive_cmds += 1
                         if self._start_retries < SWITCH_MAX_START_RETRIES:
                             self._start_retries += 1
                             self.log(
@@ -573,16 +799,21 @@ class EVChargerControl(hass.Hass):
                             self._send_start()
                         elif self._start_retries == SWITCH_MAX_START_RETRIES:
                             self._start_retries += 1   # żeby zalogować tylko raz
+                            self._start_giveup_iters = 0
                             self.log(
                                 f"START ponawiany {SWITCH_MAX_START_RETRIES}x bez efektu "
-                                f"(status={charger_status}) — odpuszczam do zmiany warunków "
+                                f"(status={charger_status}) — pauza "
+                                f"{START_RETRY_COOLDOWN_ITERS * UPDATE_INTERVAL_S // 60} min "
                                 f"(auto pelne / odlaczone?)", level="WARNING")
             else:
+                if self._try_wake_session(charger_data):
+                    return   # cykl budzenia zajął tę iterację
                 # Stan zgadza się z intencją — wyzeruj liczniki ponowień.
                 self._charger_active        = True
                 self._switch_mismatch_iters = 0
                 self._start_retries         = 0
                 self._stop_retries          = 0
+                self._unresponsive_cmds     = 0
 
         elif mode in ("BATTERY_PRIORITY", "IDLE", "OFFLINE"):
             if charger_working:
@@ -598,6 +829,7 @@ class EVChargerControl(hass.Hass):
                     self._switch_mismatch_iters += 1
                     if self._switch_mismatch_iters >= SWITCH_RETRY_ITERATIONS:
                         self._switch_mismatch_iters = 0
+                        self._unresponsive_cmds += 1
                         if self._stop_retries < SWITCH_MAX_STOP_RETRIES:
                             self._stop_retries += 1
                             self.log(
@@ -626,6 +858,63 @@ class EVChargerControl(hass.Hass):
                 self._switch_mismatch_iters = 0
                 self._start_retries         = 0
                 self._stop_retries          = 0
+                self._unresponsive_cmds     = 0
+
+    def _verify_current(self, charger_data):
+        """Czy wallbox faktycznie przyjął zadany prąd (DP 150).
+
+        Bez tego komenda do martwego urządzenia wygląda jak sukces — 2026-08-11
+        skrypt wysłał 6A, 9A, 7A i 8A do zawieszonego wallboxa i każdą uznał za
+        wykonaną, bo set_value nie zgłosił błędu.
+        """
+        # Tylko gdy wallbox realnie pracuje. Stojący potrafi raportować co
+        # innego niż ostatnio zadane i weryfikowanie go dawałoby ponowienia
+        # co minutę — czyli dokładnie to pikanie, które usuwał Problem 23.
+        if (not charger_data["online"]
+                or charger_data["status"] not in CHARGER_WORKING_STATES
+                or self._last_sent_current <= 0):
+            return
+        if charger_data["current_a"] == self._last_sent_current:
+            self._current_mismatch_iters = 0
+            return
+        self._current_mismatch_iters += 1
+        if self._current_mismatch_iters >= CURRENT_VERIFY_ITERS:
+            self._current_mismatch_iters = 0
+            self._unresponsive_cmds += 1
+            self.log(
+                f"Prad {self._last_sent_current}A nie przyjal sie — wallbox "
+                f"raportuje {charger_data['current_a']}A. Ponawiam.",
+                level="WARNING")
+            self._set_current(self._last_sent_current)
+
+    def _try_wake_session(self, charger_data):
+        """Wallbox pracuje, ale auto nie pobiera — przerwij i wznów sesję.
+
+        Zwraca True, gdy cykl budzenia zajął tę iterację. START nie jest tu
+        wysyłany: po skutecznym STOPie wallbox schodzi z WORKING i normalna
+        ścieżka `not charger_working` wyśle START w następnej iteracji.
+        """
+        if charger_data["power_w"] > 0:
+            self._wake_attempts = 0          # realny pobór — sesja żyje
+            return False
+        if self._working_zero_power_streak < WAKE_CYCLE_AFTER_ITERS:
+            return False                     # auto negocjuje, to jeszcze norma
+        if self._wake_attempts >= WAKE_CYCLE_MAX_ATTEMPTS:
+            return False                     # limit wyczerpany, nie klikamy dalej
+
+        self._wake_attempts += 1
+        minutes = self._working_zero_power_streak * UPDATE_INTERVAL_S // 60
+        self.log(
+            f"Auto nie pobiera od {minutes} min mimo statusu WORKING — "
+            f"cykl budzenia {self._wake_attempts}/{WAKE_CYCLE_MAX_ATTEMPTS} "
+            f"(STOP teraz, START w nastepnej iteracji)", level="WARNING")
+        if self._set_switch(False):
+            self._last_sent_switch          = False
+            self._switch_mismatch_iters     = 0
+            # Zeruj streak, żeby druga próba przyszła po pełnym oknie
+            # obserwacji, a nie w następnej iteracji.
+            self._working_zero_power_streak = 0
+        return True
 
     def _send_start(self):
         """Wyślij START (z czyszczeniem harmonogramu). _last_sent_switch

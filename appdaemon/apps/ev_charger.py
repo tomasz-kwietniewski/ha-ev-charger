@@ -436,13 +436,20 @@ class EVChargerControl(hass.Hass):
         # z brakiem łączności, bo lekarstwo jest inne.
         raw = charger_data.get("metrics_raw")
         if charger_data["online"] and raw:
-            if raw == self._last_metrics_raw:
-                self._frozen_metrics_streak += 1
-            else:
+            if raw != self._last_metrics_raw:
                 # Ten odczyt otwiera nową serię, więc 1 a nie 0 — streak liczy
                 # odczyty, nie porównania.
                 self._frozen_metrics_streak = 1
                 self._last_metrics_raw = raw
+            elif self._iters_since_active_mode > HEALTH_ACTIVE_GRACE_ITERS:
+                # Dłuższy postój (noc, PAUSE w oczekiwaniu na słońce): prąd nie
+                # płynie, więc stały pomiar niczego nie dowodzi. Gdyby streak
+                # rósł także tutaj, pierwsza iteracja po powrocie nadwyżki
+                # dawałaby natychmiastowy fałszywy alarm — a powiadomienie,
+                # które myli się co rano, przestaje cokolwiek znaczyć.
+                self._frozen_metrics_streak = 0
+            else:
+                self._frozen_metrics_streak += 1
 
         frozen       = self._is_charger_frozen()
         unresponsive = self._unresponsive_cmds >= UNRESPONSIVE_CMD_THRESHOLD

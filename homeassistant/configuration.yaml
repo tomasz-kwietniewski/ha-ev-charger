@@ -9,10 +9,8 @@ automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
 
-http:
-  use_x_forwarded_for: true
-  trusted_proxies:
-    - 172.30.33.0/24
+# Konfiguracja http (use_x_forwarded_for, trusted_proxies) przeniesiona do UI:
+# Ustawienia > System > Sieć > HTTP server. YAML wycofany w HA 2026.8, przestaje działać w 2027.2.0.
 
 # Zachowaj historię ważnych sensorów przez 365 dni
 recorder:

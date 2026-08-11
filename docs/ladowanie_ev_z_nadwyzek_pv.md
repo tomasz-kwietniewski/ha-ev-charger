@@ -323,6 +323,8 @@ Rozstrzygnięciem był pełny bilans Sofara — porównanie PV, obciążenia, ma
 
 W skrypcie dodałem **watchdog** który ostrzega w logach (poziom WARNING) gdy w aktywnym trybie ładowania utrzymuje się `status=WORKING + power=0W` przez ponad 10 minut. Próg konfigurowalny przez stałą `WATCHDOG_FROZEN_DP_THRESHOLD`. Skrypt nie restartuje sam — wymagana ręczna interwencja w Smart Life (na razie, do dalszego rozważenia).
 
+> **Uzupełnienie z 11 sierpnia 2026:** zdanie „sterowanie działa, tylko pomiary kłamią" okazało się prawdziwe jedynie dla łagodniejszej postaci tej usterki. Ten sam firmware potrafi zawiesić się głębiej: zamrożone są wtedy również status DP 109 i wykonywanie komend DP 140, choć urządzenie nadal odpowiada w sieci. Pełny opis, sygnatura rozpoznawcza i siedem poprawek w samym skrypcie znajdują się w Problemie 24.
+
 ### Problem 15: DP 151 — chmura Tuya potrafi wpychać harmonogram
 
 Po reboocie wallboxa zaobserwowałem że DP 151 (harmonogram) zmienił się z pustego `{"m":0,"dt":0,"ss":"00:00","se":"00:00"}` na `{"m":0,"dt":0,"ss":"15:00","se":"17:00"}` — chmura Tuya wpchnęła resztkowy harmonogram. Pole `m:0` oznacza nieaktywny, więc *w tym przypadku* nie blokuje ładowania, ale daje ślad że chmura może modyfikować wallbox lokalnie bez naszego udziału.
@@ -452,6 +454,51 @@ Efekt zmierzony na symulacji, w tym na realnych nadwyżkach z logów:
 Koszt wolniejszego podbijania mocy to 0,04-0,09 kWh, czyli kilka groszy. Weryfikacja na produkcji potwierdziła rzecz jeszcze ładniejszą: w oknie 2,5 minuty PV spadło chwilowo z 6,8 kW do 1,6 kW (przelotna chmura), a prąd **nie zmienił się ani razu** — dołek nie utrzymał się przez wymagane dwie iteracje, więc sterownik go zignorował i słońce wróciło.
 
 **Wniosek ogólny:** przy sterowaniu z pętlą zwrotną nie wystarczy poprawnie policzyć wartość zadaną. Trzeba jeszcze zapytać, jak szybko obiekt na nią odpowiada, i nie wysyłać komend częściej. Inaczej regulator ściga własny ogon.
+
+---
+
+### Problem 24: Wallbox zawieszony przez 36 godzin, a system tego nie zauważył
+
+Ten problem zgłosiłem ja, patrząc na wykres przepływów. Cztery kilowaty nadwyżki szły do sieci, auto stało podłączone, a na jego desce widniało „ładowanie zakończone". Skrypt w tym czasie pracował z pozoru wzorowo: liczył nadwyżkę, trzymał tryb SOLAR, regulował prąd do 9A, potem do 7A, potem do 8A.
+
+Diagnoza zajęła kilkanaście minut i sprowadziła się do jednego pytania: **czy dane, które czytamy, w ogóle są świeże?**
+
+Watchdog raportował „prawdopodobne zamrożenie DP 102" cztery razy w ciągu 36 godzin. Za każdym razem dołączał surowy odczyt. Wszystkie cztery były identyczne co do bitu:
+
+```
+{"L1":[2430,0,0],"L2":[2430,0,0],"L3":[2430,0,0],"t":330,"p":0,"d":0,"e":0}
+```
+
+Napięcie 243,0 V dokładnie takie samo na trzech fazach i temperatura obudowy niezmienna od poprzedniego dnia. Realny pomiar tak nie wygląda: napięcie w sieci drga o kilka woltów w każdej minucie, a trzy fazy nigdy nie mają identycznej wartości. To nie było „auto nie chce ładować" tylko martwy blok danych.
+
+Reszta obrazu pasowała do zawieszenia firmware, nie do problemu z autem:
+
+- **komendy ignorowane w obie strony** - cztery START-y poprzedniego dnia przy statusie `IDLE` i cztery STOP-y następnego przy `WORKING`, wszystkie bez najmniejszej reakcji;
+- **641 kolejnych odczytów statusu `WORKING`** bez jednej zmiany mocy;
+- **ani jednej iteracji z mocą powyżej zera przez 36 godzin**, licznik sesji na 0,000 kWh;
+- przy tym zero błędów łączności, a ping do wallboxa wracał w 3 ms.
+
+Urządzenie odpowiadało w sieci, tylko jego warstwa aplikacyjna stała. Auto pokazywało „ładowanie zakończone", bo wallbox przestał podawać PWM na Control Pilot i sesja została zamknięta.
+
+Lekarstwo okazało się takie samo jak przy Problemie 14: **Reboot z aplikacji Smart Life** (Settings, nie Reset to Factory). Moc skoczyła z 0 na 3700 W w niecałą minutę, przy zupełnie niezmienionym kodzie. Ślad restartu widać w logach po tym, że chmura Tuya wpycha wtedy swój harmonogram na DP 151 - dokładnie tak, jak opisuje Problem 15.
+
+**Ale najciekawsze jest to, co ta awaria powiedziała o samym skrypcie.** Wallbox zawiesił się z powodu firmware i na to nie mam wpływu. To, że nikt się o tym nie dowiedział przez półtorej doby przy dwóch słonecznych dniach, było już winą kodu. Znalazłem siedem osobnych usterek, wszystkie z tej samej rodziny: **system nie odróżniał „urządzenie milczy" od „urządzenie mówi, że wszystko gra".**
+
+1. **Watchdog diagnozował po najsłabszym możliwym sygnale.** Patrzył na `power_w == 0`, co wygląda identycznie przy awarii i przy aucie, które jest po prostu naładowane. Mocniejsza sygnatura leżała w danych przez cały czas: niezmienny surowy DP 102. Teraz porównujemy właśnie ten ciąg, a najczystszym wskaźnikiem jest pole `t` z temperaturą, bo ono drga zawsze. Czas wykrycia spadł z „nigdy" do pięciu minut.
+
+2. **Licznik gubił się przy migotaniu trybu.** Streak liczył się tylko w trybie aktywnym, więc każde zejście do IDLE kasowało go do zera. Przy nadwyżce stojącej na granicy progu tryb przerzuca się co kilka iteracji, i licznik wyzerował się w połowie awarii przy stanie 40. Ten sam błąd podcinał fallback kompensacji, który bez streaka przestawał podstawiać ostatnią znaną moc, przez co skrypt widział wielki deficyt i STOP-ował realnie trwającą sesję. Jedna poprawka naprawiła oba.
+
+3. **Jedyną reakcją na awarię był WARNING w logu.** Teraz powstaje powiadomienie w Home Assistant, jedno na epizod, kasowane automatycznie po powrocie wallboxa do pracy.
+
+4. **START i STOP miały rozłączne liczniki i żaden nie łączył kropek.** Osobno mieściły się w swoich limitach i milkły, choć razem opowiadały jedną historię: to urządzenie nie wykonuje niczego, o co je prosimy.
+
+5. **„Odpuszczam do zmiany warunków" znaczyło w praktyce „do jutra".** Po trzech nieudanych próbach startu skrypt zamilkł, a licznik prób resetował się wyłącznie w gałęzi nieaktywnego trybu, w którą przy trwałej nadwyżce się nie wchodzi. Efekt: cisza od 10:30 do końca dnia, przy nadwyżce sięgającej 8,6 kW. Teraz po 30 minutach wraca kolejna seria prób, a zmiana statusu ładowarki resetuje liczniki od razu.
+
+6. **Przy statusie `WORKING` skrypt nie miał żadnej ścieżki wznowienia sesji.** Warunek `if not charger_working` nigdy nie był prawdziwy, więc START nie mógł pójść z definicji. To boli podwójnie, bo auta Stellantisa po zatrzymaniu ładowania zamykają sesję i same jej nie wznawiają. Doszedł cykl STOP i START po 15 minutach bez poboru, z twardym limitem dwóch prób, żeby nie wrócić do klikania stycznikiem z Problemu 13.
+
+7. **Zadany prąd szedł na ślepo.** DP 150 mówi, jaki prąd wallbox faktycznie ma ustawiony, i był czytany, ale nigdy porównywany z tym, co wysłaliśmy. Skrypt posłał 6A, 9A, 7A i 8A do martwego urządzenia i każdą komendę uznał za sukces, bo `set_value` nie zgłosił wyjątku.
+
+**Wniosek ogólny, i to chyba najważniejszy z całego projektu:** status z urządzenia to deklaracja, nie fakt. `WORKING` znaczy tylko tyle, że wallbox tak twierdzi. Dopóki nie skonfrontuje się tej deklaracji z niezależnym pomiarem - świeżością danych, sprzężeniem zwrotnym z komendy, realnym przepływem mocy - sterownik może godzinami wykonywać precyzyjne obliczenia na martwym obiekcie i nie mieć o tym pojęcia. Warto zapytać nie tylko „co urządzenie mówi", ale też „kiedy ostatnio powiedziało coś nowego".
 
 ---
 
@@ -675,4 +722,4 @@ Latem planujemy naładować całą baterię 75 kWh praktycznie bez kosztów. Pol
 
 ---
 
-*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu). Aktualizacja 4: 8 czerwca 2026 — Problemy 13–16 (STOP-spam w gałęzi IDLE, zamrożony DP 102 w firmware dé EV v2.9.4, chmura Tuya a harmonogram DP 151, ukryte pole `e` = energia sesji × 0,1 kWh); archiwum historii miesięcznej z retencją 10 lat — wykres i tabela porównawcza na dashboardzie, ręczny przycisk archiwizacji (Problemy 17–18: dane ginące przy resecie miesiąca oraz `set_state` 400 w HA 2026.x -> publikacja przez REST API rdzenia). Aktualizacja 6: 28 lipca 2026 — Problem 23: regulacja goniąca szum (prąd zmieniany co 30 s, sekwencje 10A → 11A → 10A). Histereza ±250 W wokół progu stopnia plus potwierdzenie zmiany przez 2 iteracje; duży spadek nadal natychmiastowy. Zmierzone: 52 → 1 zmiana w pochmurne pół godziny. Aktualizacja 5: 27 lipca 2026 — audyt kodu, Problemy 19–22: regulacja SOLAR „uciekająca" w górę przy zachmurzeniu (nadwyżka liczona teraz jako `min(PCC, PV − dom)` bez podłogi), dedup komend START/STOP bez ponowień, TinyTuya zwracająca błąd jako dict zamiast wyjątku, nieatomowy zapis pliku persistent; tryb NEGATIVE_PRICE zszedł z 16A na 13A (bufor na dom), doszły lekkie testy jednostkowe w `tests/`.*
+*Artykuł napisany na podstawie rzeczywistej instalacji. Pierwsza wersja: maj 2026. Aktualizacja: maj 2026 — dodano tryb EMERGENCY, obsługę stanu PAUSE, uśrednianie PCC, obniżenie progu startu do 1600W. Aktualizacja 2: maj 2026 — uśrednianie PCC rozszerzone do 3 próbek (90s), bias wydzielony jako nazwana stała SURPLUS_BIAS_W, poprawka komentarzy znaku PCC. Aktualizacja 3: 12 maja 2026 — dodano Problem 12 (AppDaemon skanuje apps/ rekurencyjnie — duplikaty aplikacji przy backupie wewnątrz folderu). Aktualizacja 4: 8 czerwca 2026 — Problemy 13–16 (STOP-spam w gałęzi IDLE, zamrożony DP 102 w firmware dé EV v2.9.4, chmura Tuya a harmonogram DP 151, ukryte pole `e` = energia sesji × 0,1 kWh); archiwum historii miesięcznej z retencją 10 lat — wykres i tabela porównawcza na dashboardzie, ręczny przycisk archiwizacji (Problemy 17–18: dane ginące przy resecie miesiąca oraz `set_state` 400 w HA 2026.x -> publikacja przez REST API rdzenia). Aktualizacja 6: 28 lipca 2026 — Problem 23: regulacja goniąca szum (prąd zmieniany co 30 s, sekwencje 10A → 11A → 10A). Histereza ±250 W wokół progu stopnia plus potwierdzenie zmiany przez 2 iteracje; duży spadek nadal natychmiastowy. Zmierzone: 52 → 1 zmiana w pochmurne pół godziny. Aktualizacja 5: 27 lipca 2026 — audyt kodu, Problemy 19–22: regulacja SOLAR „uciekająca" w górę przy zachmurzeniu (nadwyżka liczona teraz jako `min(PCC, PV − dom)` bez podłogi), dedup komend START/STOP bez ponowień, TinyTuya zwracająca błąd jako dict zamiast wyjątku, nieatomowy zapis pliku persistent; tryb NEGATIVE_PRICE zszedł z 16A na 13A (bufor na dom), doszły lekkie testy jednostkowe w `tests/`. Aktualizacja 7: 11 sierpnia 2026 - Problem 24: wallbox zawieszony przez 36 godzin (odpowiadał w sieci, ale nie aktualizował danych i ignorował wszystkie komendy), a system tego nie zauważył. Wykrywanie po niezmiennym surowym DP 102 zamiast po samym zerze mocy, powiadomienie w Home Assistant zamiast WARNING w logu, cykl budzenia sesji przy statusie WORKING bez poboru, weryfikacja zadanego prądu przez DP 150, koniec z trwałym odpuszczaniem prób startu. Testy jednostkowe: 24 -> 50.*

@@ -530,7 +530,13 @@ Skoro komendy nie widać w odczycie, musi być **tylko do zapisu**. I to nie jes
 
 Pozostawało zapytać chmurę Tuya, która zna pełny model urządzenia razem z punktami do zapisu. Tu trafiłem na mur: subskrypcja IoT Core wygasła, a trial jest jednorazowy na konto.
 
-Zostało sprawdzanie kandydatów na żywym sprzęcie. Projekt tuya-local opisuje dla tego produktu przycisk `class: restart` na **DP 142** - i to była dobra hipoteza, tyle że nieprawdziwa dla naszego firmware. Sto dwadzieścia sześć próbek, trzy różne formaty wartości, zero spadków napięcia Control Pilot. **DP 188** okazał się działającym przyciskiem „Refresh" - w odpowiedzi przysłał komplet danych - ale restartu nie robi.
+Zostało sprawdzanie kandydatów na żywym sprzęcie. Projekt tuya-local opisuje dla tego produktu przycisk `class: restart` na **DP 142**, a model producenta z chmury potwierdził jego nazwę: `x_do_reboot`. Hipoteza była więc dobra. Gorzej z jej sprawdzeniem.
+
+Za pierwszym razem nic. Za drugim, po wysłaniu pełnego zbocza `False → True`, napięcie Control Pilot spadło do zera dokładnie sekundę po komendzie - czyli **zadziałało**. I to był jedyny taki przypadek. Pięć kolejnych prób, w tym po sześciu minutach przerwy i tuż po ręcznym reboocie z aplikacji, nie dało nic.
+
+Jeden sukces na sześć prób to nie jest mechanizm, tylko anegdota. Automat ma ratować mnie przed 22-godzinną awarią, więc nie może opierać się na komendzie, która działa raz na kilka razy w okolicznościach, których nie umiem odtworzyć. **DP 188** okazał się przy okazji działającym przyciskiem „Refresh" - w odpowiedzi przysłał komplet danych - ale restartu nie robi.
+
+Warto za to zapamiętać samą zasadę wysyłania takiej komendy: **zboczem, nie wartością**. Punkty tylko do zapisu nie raportują swojego stanu nigdzie - ani lokalnie, ani w chmurze, która pokazuje `x_do_charge` sprzed miesięcy, choć skrypt wysyła na niego START i STOP codziennie. Skoro nie wiadomo, czy punkt nie siedzi już w wartości docelowej, samo wysłanie `true` może być żadną zmianą i przepaść bez śladu.
 
 Jedna rzecz z tego etapu jest warta zapamiętania jako metoda. Pierwszy test uznałem za obiecujący, bo po komendzie wallbox cztery razy przestał odpowiadać, a chmura wepchnęła swój harmonogram - czyli dokładnie to, co widuję po prawdziwym restarcie. Dopiero **próba kontrolna**, czyli identyczny pomiar bez wysyłania czegokolwiek, pokazała, że to był zwykły szum sieciowy. Bez niej wpisałbym do kodu komendę, która nic nie robi, i dowiedziałbym się o tym przy następnej awarii - czyli w najgorszym możliwym momencie. Przy odpytywaniu urządzenia, które ktoś inny też odpytuje, pomiar bez grupy kontrolnej jest wart tyle co nic.
 

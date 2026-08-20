@@ -4,6 +4,7 @@ import requests
 import json
 import datetime
 import os
+import time
 
 # Dane urządzenia ładowarki — czytane z osobnego pliku secrets.
 # UWAGA na mapowanie ścieżek AppDaemon: w środowisku add-onu "/config/"
@@ -162,8 +163,12 @@ HEALTH_NOTIFY_ID = "ev_charger_awaria"
 #
 # Komenda restartu — patrz _reboot_charger(). Do czasu ustalenia kodu DP
 # mechanizm działa "na sucho": wykrywa, loguje i woła człowieka jak dotąd.
-REBOOT_DP       = None    # numer DP wywołującego restart (ustalany snifferem)
-REBOOT_DP_VALUE = True    # wartość wysyłana na ten DP
+REBOOT_DP       = None    # numer DP wywołującego restart (patrz _reboot_charger)
+REBOOT_DP_VALUE = True    # wartość kończąca zbocze
+# Przerwa między dwiema połówkami zbocza. AppDaemon ma jeden wątek roboczy,
+# więc to blokuje pętlę — ale restart zdarza się najwyżej raz na kilka dni,
+# a 2,5 s to mniej niż jedna iteracja.
+REBOOT_EDGE_GAP_S = 2.5
 
 # Ile prób restartu w jednej awarii. Restart jest tani (wallbox wstaje w ~1 min),
 # ale gdy trzy z rzędu nie pomogły, problem jest głębszy niż firmware i dalsze
@@ -650,6 +655,15 @@ class EVChargerControl(hass.Hass):
         if REBOOT_DP is None:
             return False
         try:
+            # ZBOCZE, nie sama wartość. DP restartu jest typu bool i wyzwala się
+            # zmianą stanu — samo wysłanie True nie robi nic, jeśli punkt już w
+            # tym stanie siedzi. A nigdy nie wiemy, czy siedzi: punkty tylko do
+            # zapisu nie raportują swojej wartości ani w lokalnym odczycie, ani
+            # w chmurze (x_do_charge pokazuje tam stan sprzed miesięcy, choć
+            # wysyłamy na niego START/STOP codziennie). Bez pauzy urządzenie
+            # potrafi połknąć obie zmiany jako jedną paczkę.
+            self._device.set_value(REBOOT_DP, not REBOOT_DP_VALUE)
+            time.sleep(REBOOT_EDGE_GAP_S)
             self._device.set_value(REBOOT_DP, REBOOT_DP_VALUE)
         except Exception as e:
             self.log(f"Restart wallboxa nie poszedl: {e}", level="ERROR")

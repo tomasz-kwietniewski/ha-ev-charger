@@ -803,20 +803,26 @@ _TEST_REBOOT_DP = 188        # udawany kod komendy restartu na czas testow
 
 def _z_komenda_restartu(fn):
     """Udaje, ze kod DP restartu jest juz ustalony (w produkcji REBOOT_DP=None
-    do czasu potwierdzenia go snifferem na zywym urzadzeniu)."""
+    do czasu potwierdzenia go na zywym urzadzeniu). Zeruje tez przerwe w
+    zboczu, zeby zestaw testow nie czekal realnych sekund."""
     def wrapper():
-        stare = ev.REBOOT_DP
+        stare_dp, stara_przerwa = ev.REBOOT_DP, ev.REBOOT_EDGE_GAP_S
         ev.REBOOT_DP = _TEST_REBOOT_DP
+        ev.REBOOT_EDGE_GAP_S = 0
         try:
             fn()
         finally:
-            ev.REBOOT_DP = stare
+            ev.REBOOT_DP = stare_dp
+            ev.REBOOT_EDGE_GAP_S = stara_przerwa
     wrapper.__name__ = fn.__name__
     return wrapper
 
 
 def _reboots(c):
-    return [call for call in c._device.calls if call[0] == str(_TEST_REBOOT_DP)]
+    """Ile restartow poszlo. Kazdy to zbocze False -> True, wiec liczymy
+    domkniecia zbocza, nie pojedyncze zapisy."""
+    return [call for call in c._device.calls
+            if call[0] == str(_TEST_REBOOT_DP) and call[1] is ev.REBOOT_DP_VALUE]
 
 
 def _pushes(c):
@@ -830,6 +836,23 @@ def test_auto_reboot_fires_instead_of_waiting_for_human():
     assert len(_reboots(c)) == 1, \
         "zawieszenie ma wywolac restart, a nie samo powiadomienie do panelu"
     assert _pushes(c), "pierwszy restart ma isc na telefon"
+
+
+@_z_komenda_restartu
+def test_reboot_is_sent_as_full_edge():
+    # Punkt restartu jest typu bool i wyzwala sie ZMIANA stanu. Samo wyslanie
+    # True nie robi nic, gdy punkt juz w tym stanie siedzi - a nigdy nie wiemy,
+    # czy siedzi, bo punkty write-only nie raportuja swojej wartosci.
+    # Sprawdzone na zywym urzadzeniu 2026-08-20: samo True = zero reakcji,
+    # zbocze False -> True = spadek napiecia Control Pilot do 0 V.
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1)
+    zapisy = [call for call in c._device.calls if call[0] == str(_TEST_REBOOT_DP)]
+    assert len(zapisy) >= 2, f"restart ma isc zboczem (2 zapisy), poszlo {len(zapisy)}"
+    assert zapisy[0][1] is not ev.REBOOT_DP_VALUE, \
+        "zbocze zaczyna sie od wartosci przeciwnej"
+    assert zapisy[1][1] is ev.REBOOT_DP_VALUE, \
+        "zbocze konczy sie wartoscia wyzwalajaca"
 
 
 @_z_komenda_restartu

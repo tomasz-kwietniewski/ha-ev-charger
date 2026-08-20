@@ -193,12 +193,13 @@ AUTO_REBOOT_ENTITY = "input_boolean.ev_auto_restart"
 
 # Push na telefon. Panel HA zostaje jako drugi kanał: awaria 18-19.08 przeleżała
 # tam 22 godziny niezauważona, więc telefon jest teraz kanałem podstawowym.
-# Celowo konkretne urządzenie, nie grupa "notify/notify": ta ostatnia rozsyła na
-# WSZYSTKIE zarejestrowane telefony, więc alarm o wallboxie budziłby też Olę.
-# Usługi dostępne w tym HA (sprawdzone 2026-08-20): notify/notify,
-# notify/mobile_app_tomek_oneplus_12, notify/mobile_app_ola_samsung_s23,
-# notify/persistent_notification, notify/send_message.
-NOTIFY_SERVICE = "notify/mobile_app_tomek_oneplus_12"
+# "notify/notify" to grupa rozsyłająca na WSZYSTKIE zarejestrowane telefony
+# (u nas dwa) — i tak ma być, decyzja Tomka 2026-08-20: im więcej par oczu, tym
+# mniejsza szansa, że awaria znów przeleży dobę. Gdyby kiedyś miało trafiać
+# tylko do jednej osoby, dostępne są też usługi per urządzenie:
+# notify/mobile_app_tomek_oneplus_12, notify/mobile_app_ola_samsung_s23.
+# Wysyłka potwierdzona na żywym HA 2026-08-20 — push dotarł na telefon.
+NOTIFY_SERVICE = "notify/notify"
 
 # Tryby, w których skrypt świadomie chce ładować.
 ACTIVE_CHARGING_MODES = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")

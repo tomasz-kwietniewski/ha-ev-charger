@@ -151,6 +151,47 @@ HEALTH_ACTIVE_GRACE_ITERS = 6   # 3 min od ostatniej chęci ładowania
 UNRESPONSIVE_CMD_THRESHOLD = 4
 HEALTH_NOTIFY_ID = "ev_charger_awaria"
 
+# --- Automatyczny restart zawieszonego wallboxa (2026-08-19) ---
+# Powód: wykrywanie awarii działa od 2026-08-11 i jest celne, ale jedyną
+# reakcją było powiadomienie w panelu HA. Awaria 18-19 sierpnia pokazała, ile
+# to kosztuje: wallbox stanął 18.08 ok. 13:00, watchdog alarmował sześć razy,
+# a ręka kliknęła Reboot dopiero 19.08 o 11:30. 22,5 godziny martwoty i co
+# najmniej 12,2 kWh nadwyżki oddanej do sieci zamiast do auta. Jedyne znane
+# lekarstwo (Reboot) da się wysłać automatem, więc alarm bez akcji jest
+# marnowaniem informacji, którą skrypt ma od pierwszych 5 minut awarii.
+#
+# Komenda restartu — patrz _reboot_charger(). Do czasu ustalenia kodu DP
+# mechanizm działa "na sucho": wykrywa, loguje i woła człowieka jak dotąd.
+REBOOT_DP       = None    # numer DP wywołującego restart (ustalany snifferem)
+REBOOT_DP_VALUE = True    # wartość wysyłana na ten DP
+
+# Ile prób restartu w jednej awarii. Restart jest tani (wallbox wstaje w ~1 min),
+# ale gdy trzy z rzędu nie pomogły, problem jest głębszy niż firmware i dalsze
+# klikanie tylko zaciemnia obraz — wtedy woła się człowieka.
+REBOOT_MAX_ATTEMPTS   = 3
+# Odstęp między próbami. Musi być dłuższy niż FROZEN_METRICS_THRESHOLD (5 min),
+# żeby detekcja zdążyła ocenić, czy poprzedni restart pomógł.
+REBOOT_COOLDOWN_ITERS = 20    # 20 × 30 s = 10 min
+# Po tylu iteracjach zdrowej pracy uznajemy awarię za zamkniętą i licznik prób
+# rusza od zera. Bez tego trzy restarty rozłożone na miesiąc wyczerpałyby limit.
+REBOOT_ATTEMPTS_RESET_ITERS = 120   # 1 h
+
+# Profilaktyczny restart nocny — higiena na wypadek zawieszeń, które zdążą się
+# zacząć i skończyć poza oknem obserwacji. Godzina wybrana tak, by nie kolidować
+# z niczym: tryb zimowy ładuje 22:00-6:00, więc dodatkowo pilnujemy, żeby nie
+# przerwać realnie trwającego ładowania.
+REBOOT_NIGHTLY_HOUR = 4       # None = wyłącz profilaktykę
+
+# Kill switch w HA. Brak encji (get_state -> None) oznacza "włączone", żeby
+# mechanizm działał od razu po wdrożeniu, zanim helper powstanie w interfejsie.
+AUTO_REBOOT_ENTITY = "input_boolean.ev_auto_restart"
+
+# Push na telefon. "notify/notify" trafia do wszystkich zarejestrowanych
+# aplikacji mobilnych — działa bez znajomości nazwy konkretnego urządzenia.
+# Panel HA zostaje jako drugi kanał: awaria 18-19.08 przeleżała tam 22 godziny
+# niezauważona, więc telefon jest teraz kanałem podstawowym.
+NOTIFY_SERVICE = "notify/notify"
+
 # Tryby, w których skrypt świadomie chce ładować.
 ACTIVE_CHARGING_MODES = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
 
@@ -192,7 +233,14 @@ HISTORY_SENSOR     = "sensor.ev_historia_miesieczna"
 HISTORY_MAX_MONTHS = 120   # ile miesięcy trzymamy (10 lat)
 
 # Stany ładowarki
-CHARGER_READY_STATES   = {"PAUSE", "SLEEP", "IDLE", "UNKNOWN"}
+# IDLEINS złapany snifferem 2026-08-19 15:04:49 — stan przejściowy w sekwencji
+# startu sesji: PAUSE -> IDLE -> IDLEINS -> WORKING, trwał 9 sekund
+# (najpewniej "idle, cable inserted"). Nie było go na żadnej liście, więc
+# _decide() widział status spoza obu zbiorów i zwracał "auto niepodłączone".
+# Skutek przy trafieniu pętli w to okno: iteracja bez sterowania, a gdyby
+# wallbox zawiesił się właśnie tutaj — watchdog milczy, bo zamrożenie liczy
+# się tylko wtedy, gdy skrypt w ogóle chce ładować.
+CHARGER_READY_STATES   = {"PAUSE", "SLEEP", "IDLE", "IDLEINS", "UNKNOWN"}
 CHARGER_WORKING_STATES = {"WORKING"}
 
 
@@ -243,6 +291,15 @@ class EVChargerControl(hass.Hass):
         self._iters_since_active_mode = HEALTH_ACTIVE_GRACE_ITERS + 1
         self._unresponsive_cmds      = 0
         self._health_notified        = False
+        # --- Automatyczny restart (awaria 2026-08-18/19) ---
+        self._reboot_attempts        = 0
+        self._reboot_cooldown        = 0   # iteracje do następnej dozwolonej próby
+        self._iters_healthy          = 0   # ile iteracji z rzędu wallbox jest zdrowy
+        self._reboot_no_cmd_logged   = False
+        # Trwałe, żeby restart AppDaemona w środku nocy nie wywołał drugiej
+        # profilaktyki tego samego dnia.
+        self._last_nightly_reboot_day = self._load_persistent_raw(
+            "ev_last_nightly_reboot", "")
 
     def initialize(self):
         self.log("EV Charger Control startuje...")
@@ -326,6 +383,7 @@ class EVChargerControl(hass.Hass):
         self._apply_decision(mode, target_current, charger_data)
         self._update_diag(charger_data, mode)
         self._update_health(charger_data, mode)
+        self._maybe_nightly_reboot(charger_data)
         self._update_sensors(charger_data, ha_data, mode, target_current)
         self._update_ha_helpers(charger_data, ha_data, mode, target_current)
 
@@ -453,9 +511,26 @@ class EVChargerControl(hass.Hass):
 
         frozen       = self._is_charger_frozen()
         unresponsive = self._unresponsive_cmds >= UNRESPONSIVE_CMD_THRESHOLD
+        chory        = frozen or unresponsive
 
-        if (frozen or unresponsive) and not self._health_notified:
-            self._health_notified = True
+        # Cooldown i licznik zdrowia biegną w każdej iteracji, niezależnie od
+        # tego, czy akurat alarmujemy — to one decydują, kiedy wolno ponowić
+        # restart i kiedy uznać awarię za zamkniętą.
+        if self._reboot_cooldown > 0:
+            self._reboot_cooldown -= 1
+        if chory:
+            self._iters_healthy = 0
+        else:
+            self._iters_healthy += 1
+            if (self._reboot_attempts
+                    and self._iters_healthy >= REBOOT_ATTEMPTS_RESET_ITERS):
+                self.log(
+                    f"Wallbox pracuje poprawnie od "
+                    f"{self._iters_healthy * UPDATE_INTERVAL_S // 60} min — "
+                    f"zeruje licznik restartow ({self._reboot_attempts} w tej awarii)")
+                self._reboot_attempts = 0
+
+        if chory:
             powody = []
             if frozen:
                 powody.append(
@@ -467,19 +542,41 @@ class EVChargerControl(hass.Hass):
                     f"{self._unresponsive_cmds} komend bez efektu "
                     f"(status trzyma się na {charger_data['status']})"
                 )
-            tekst = (
-                "Ładowarka nie reaguje: " + ", ".join(powody) + ". "
-                "Nadwyżka PV idzie do sieci zamiast do auta. "
-                "Lekarstwo: Smart Life -> ładowarka -> Settings -> Reboot "
-                "(NIE Reset to Factory)."
-            )
-            self.log(f"AWARIA WALLBOXA: {tekst} "
-                     f"DP102_raw={raw!r}", level="ERROR")
-            self._notify_problem(tekst)
-        elif self._health_notified and not frozen and not unresponsive:
+            opis = ", ".join(powody)
+
+            # Najpierw automat, dopiero potem człowiek. Restart jest jedynym
+            # znanym lekarstwem, a skrypt wie o awarii 22 godziny wcześniej
+            # niż domownik zajrzy do panelu HA.
+            if self._try_auto_reboot(opis, raw):
+                return
+
+            if not self._health_notified:
+                self._health_notified = True
+                tekst = (
+                    "Ładowarka nie reaguje: " + opis + ". "
+                    "Nadwyżka PV idzie do sieci zamiast do auta. " + self._reboot_hint()
+                )
+                self.log(f"AWARIA WALLBOXA: {tekst} "
+                         f"DP102_raw={raw!r}", level="ERROR")
+                self._notify_problem(tekst)
+                self._notify_push("EV: ładowarka nie reaguje", tekst)
+        elif self._health_notified:
             self._health_notified = False
             self.log("Wallbox wrócił do pracy — kasuję powiadomienie o awarii")
             self._dismiss_problem()
+
+    def _reboot_hint(self):
+        """Co ma zrobić człowiek — zależnie od tego, czy automat miał czym próbować."""
+        if REBOOT_DP is None:
+            return ("Lekarstwo: Smart Life -> ładowarka -> Settings -> Reboot "
+                    "(NIE Reset to Factory).")
+        if self._reboot_attempts >= REBOOT_MAX_ATTEMPTS:
+            return (f"Automat restartował ładowarkę {self._reboot_attempts}x bez skutku — "
+                    f"to nie jest zwykłe zawieszenie firmware'u. Sprawdź wallbox "
+                    f"na miejscu (dioda, wyłącznik nadprądowy, wtyczka w aucie).")
+        return ("Automatyczny restart jest wyłączony "
+                f"({AUTO_REBOOT_ENTITY}). Lekarstwo ręczne: Smart Life -> "
+                "ładowarka -> Settings -> Reboot (NIE Reset to Factory).")
 
     def _is_charger_frozen(self):
         """Zamrożony wallbox: DP 102 stoi, a my w ostatnich minutach chcieliśmy ładować.
@@ -490,6 +587,132 @@ class EVChargerControl(hass.Hass):
         """
         return (self._frozen_metrics_streak >= FROZEN_METRICS_THRESHOLD
                 and self._iters_since_active_mode <= HEALTH_ACTIVE_GRACE_ITERS)
+
+    # ------------------------------------------------------------------
+    # AUTOMATYCZNY RESTART WALLBOXA
+    # ------------------------------------------------------------------
+
+    def _auto_reboot_enabled(self):
+        """Kill switch w HA. Brak encji (None) znaczy "włączone" — mechanizm ma
+        działać od razu po wdrożeniu, zanim helper powstanie w interfejsie."""
+        return self.get_state(AUTO_REBOOT_ENTITY) != "off"
+
+    def _try_auto_reboot(self, opis, raw):
+        """Zawieszony wallbox: spróbuj zrestartować, zanim zawołasz człowieka.
+
+        Zwraca True, gdy restart poszedł w tej iteracji — wtedy nie alarmujemy,
+        bo za 10 minut (REBOOT_COOLDOWN_ITERS) i tak ocenimy, czy pomogło:
+        detekcja zamrożenia liczy od zera, więc martwy wallbox sam się zgłosi.
+        """
+        if REBOOT_DP is None:
+            if not self._reboot_no_cmd_logged:
+                self._reboot_no_cmd_logged = True
+                self.log(
+                    "Auto-restart nieaktywny: nie znam jeszcze komendy restartu "
+                    "(REBOOT_DP=None). Zostaje powiadomienie dla czlowieka.",
+                    level="WARNING")
+            return False
+        if not self._auto_reboot_enabled():
+            return False
+        if self._reboot_cooldown > 0:
+            return False
+        if self._reboot_attempts >= REBOOT_MAX_ATTEMPTS:
+            return False
+
+        self._reboot_attempts += 1
+        self.log(
+            f"AWARIA WALLBOXA: {opis}. Restartuje automatycznie "
+            f"(proba {self._reboot_attempts}/{REBOOT_MAX_ATTEMPTS}). "
+            f"DP102_raw={raw!r}", level="ERROR")
+
+        if not self._reboot_charger(f"zawieszenie ({opis})"):
+            return False
+
+        if self._reboot_attempts == 1:
+            self._notify_push(
+                "EV: ładowarka zawieszona",
+                f"Wykryto zawieszenie ({opis}). Restartuję ładowarkę automatycznie. "
+                f"Odezwę się ponownie tylko wtedy, gdy nie pomoże.")
+        elif self._reboot_attempts >= REBOOT_MAX_ATTEMPTS:
+            self._notify_push(
+                "EV: restart nie pomaga",
+                f"To była {self._reboot_attempts}. próba restartu i ładowarka dalej "
+                f"nie reaguje. Trzeba sprawdzić wallbox na miejscu.")
+        return True
+
+    def _reboot_charger(self, powod):
+        """Wyślij komendę restartu. JEDYNE miejsce, które wie JAK to zrobić.
+
+        Wydzielone celowo: jeśli okaże się, że firmware nie wystawia restartu
+        po LAN i trzeba będzie odcinać zasilanie przekaźnikiem, zmienia się
+        wyłącznie ta metoda — cała logika kiedy/ile razy zostaje bez zmian.
+        """
+        if REBOOT_DP is None:
+            return False
+        try:
+            self._device.set_value(REBOOT_DP, REBOOT_DP_VALUE)
+        except Exception as e:
+            self.log(f"Restart wallboxa nie poszedl: {e}", level="ERROR")
+            return False
+
+        self.log(f"RESTART WALLBOXA wyslany ({powod})")
+        # Wallbox znika z sieci na ~1 min. Wszystko, co opisuje jego stan sprzed
+        # restartu, jest już nieaktualne — w szczególności dedup komend: po
+        # restarcie urządzenie nie pamięta naszego START-u ani zadanego prądu,
+        # więc bez wyzerowania skrypt uznałby, że komendy już wysłał, i zamilkł.
+        self._frozen_metrics_streak     = 0
+        self._last_metrics_raw          = None
+        self._unresponsive_cmds         = 0
+        self._working_zero_power_streak = 0
+        self._wake_attempts             = 0
+        self._start_retries             = 0
+        self._stop_retries              = 0
+        self._switch_mismatch_iters     = 0
+        self._current_mismatch_iters    = 0
+        self._last_sent_switch          = None
+        self._last_sent_current         = -1
+        # Chmura Tuya wpycha harmonogram po każdym restarcie (2026-05-21,
+        # 2026-08-11, 2026-08-19) — niech licznik czyszczeń ma pełny limit.
+        self._schedule_clears           = 0
+        self._reboot_cooldown           = REBOOT_COOLDOWN_ITERS
+        return True
+
+    def _maybe_nightly_reboot(self, charger_data):
+        """Profilaktyczny restart raz na dobę — higiena przeciw zawieszeniom.
+
+        Nie zastępuje restartu reaktywnego, tylko go uzupełnia: awaria z 18.08
+        zaczęła się w środku dnia, więc sama profilaktyka poranna uratowałaby
+        wtedy dokładnie nic.
+        """
+        if REBOOT_NIGHTLY_HOUR is None or REBOOT_DP is None:
+            return
+        if not self._auto_reboot_enabled():
+            return
+        now = datetime.datetime.now()
+        if now.hour != REBOOT_NIGHTLY_HOUR:
+            return
+        day = now.strftime("%Y-%m-%d")
+        if self._last_nightly_reboot_day == day:
+            return
+        if not charger_data["online"]:
+            return
+        # Realnie płynący prąd jest jedynym powodem, by odpuścić: w trybie
+        # zimowym auto ładuje się nocą. Sam status WORKING nie wystarcza —
+        # zawieszony wallbox też go pokazuje, a jego akurat restartować warto.
+        if charger_data["power_w"] > 0:
+            return
+
+        self._last_nightly_reboot_day = day
+        self._save_persistent("ev_last_nightly_reboot", day)
+        self._reboot_charger("profilaktyka nocna")
+
+    def _notify_push(self, tytul, tresc):
+        """Push na telefon. Panel HA zostaje jako drugi kanał — awaria
+        18-19.08 przeleżała tam 22 godziny, zanim ktokolwiek ją zobaczył."""
+        try:
+            self.call_service(NOTIFY_SERVICE, title=tytul, message=tresc)
+        except Exception as e:
+            self.log(f"Push nie poszedl ({NOTIFY_SERVICE}): {e}", level="WARNING")
 
     def _notify_problem(self, message):
         try:

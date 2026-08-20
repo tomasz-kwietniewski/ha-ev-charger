@@ -771,6 +771,252 @@ def test_awaria_2026_08_11_wykryta_w_kilka_minut():
     assert wykryto_po <= 10, f"oczekiwano wykrycia w ~5 min, jest {wykryto_po} min"
 
 
+def test_idleins_counts_as_car_connected():
+    # Sniffer 2026-08-19 15:04:49 zlapal nieznany dotad stan przejsciowy:
+    # PAUSE -> IDLE -> IDLEINS -> WORKING. Poza lista stanow oznaczal dla
+    # _decide() "auto niepodlaczone", czyli iteracje bez sterowania.
+    c = make_ctrl()
+    set_env(c, pv=8.0, load=0.5, pcc=5.0)
+    mode, target = c._decide(ha_data(surplus_w=5000), charger("IDLEINS"))
+    assert mode == "SOLAR", \
+        f"IDLEINS to auto podlaczone i gotowe, a tryb wyszedl {mode}"
+    assert target >= ev.MIN_CURRENT_A, "przy 5 kW nadwyzki ma ruszyc ladowanie"
+
+
+def test_freeze_detected_in_idleins():
+    # Wariant grozniejszy: zawieszenie w stanie spoza list bylo niewidoczne
+    # dla watchdoga, bo zamrozenie liczy sie tylko przy checi ladowania.
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1, status="IDLEINS")
+    assert c._is_charger_frozen(), \
+        "zawieszenie w IDLEINS tez ma byc wykryte"
+
+
+# ── Automatyczny restart wallboxa (awaria 2026-08-18/19) ────────────────────
+# Kontekst: wallbox stanal 18.08 ok. 13:00, watchdog alarmowal szesc razy,
+# a Reboot ze Smart Life klikniety zostal dopiero 19.08 o 11:30. 22,5 godziny
+# martwoty i co najmniej 12,2 kWh nadwyzki oddanej do sieci. Detekcja dziala —
+# brakowalo reki, ktora klika. Ponizsze testy pilnuja tej reki.
+
+_TEST_REBOOT_DP = 188        # udawany kod komendy restartu na czas testow
+
+
+def _z_komenda_restartu(fn):
+    """Udaje, ze kod DP restartu jest juz ustalony (w produkcji REBOOT_DP=None
+    do czasu potwierdzenia go snifferem na zywym urzadzeniu)."""
+    def wrapper():
+        stare = ev.REBOOT_DP
+        ev.REBOOT_DP = _TEST_REBOOT_DP
+        try:
+            fn()
+        finally:
+            ev.REBOOT_DP = stare
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def _reboots(c):
+    return [call for call in c._device.calls if call[0] == str(_TEST_REBOOT_DP)]
+
+
+def _pushes(c):
+    return [kw for s, kw in c.service_calls if s == ev.NOTIFY_SERVICE]
+
+
+@_z_komenda_restartu
+def test_auto_reboot_fires_instead_of_waiting_for_human():
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1)
+    assert len(_reboots(c)) == 1, \
+        "zawieszenie ma wywolac restart, a nie samo powiadomienie do panelu"
+    assert _pushes(c), "pierwszy restart ma isc na telefon"
+
+
+@_z_komenda_restartu
+def test_auto_reboot_waits_between_attempts():
+    # Odstep musi byc dluzszy niz okno detekcji, inaczej skrypt restartowalby
+    # wallbox co 30 s, nie dajac mu szansy wstac (wstaje ~1 min).
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1)
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD)
+    assert len(_reboots(c)) == 1, "druga proba dopiero po cooldownie"
+    _pump_health(c, ev.REBOOT_COOLDOWN_ITERS + 2)
+    assert len(_reboots(c)) == 2, "po cooldownie ma sprobowac ponownie"
+
+
+@_z_komenda_restartu
+def test_auto_reboot_gives_up_and_calls_human():
+    # Trzy restarty bez skutku to nie jest zwykle zawieszenie firmware —
+    # wtedy automat ma zamilknac i zawolac czlowieka, zamiast klikac w kolko.
+    c = make_ctrl()
+    for _ in range(ev.REBOOT_MAX_ATTEMPTS + 2):
+        _pump_health(c, ev.REBOOT_COOLDOWN_ITERS + ev.FROZEN_METRICS_THRESHOLD + 2)
+    assert len(_reboots(c)) == ev.REBOOT_MAX_ATTEMPTS, \
+        f"limit prob to {ev.REBOOT_MAX_ATTEMPTS}, jest {len(_reboots(c))}"
+    creates = [s for s, _ in c.service_calls if s == "persistent_notification/create"]
+    assert creates, "po wyczerpaniu prob ma powstac powiadomienie w panelu"
+    tresc = " ".join(str(kw) for kw in _pushes(c))
+    assert "nie reaguje" in tresc or "nie pomaga" in tresc, \
+        "czlowiek ma dostac push, gdy restarty nie pomagaja"
+
+
+@_z_komenda_restartu
+def test_kill_switch_blocks_auto_reboot():
+    c = make_ctrl({ev.AUTO_REBOOT_ENTITY: "off"})
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 3)
+    assert not _reboots(c), "wylaczony kill switch ma zablokowac restart"
+    creates = [s for s, _ in c.service_calls if s == "persistent_notification/create"]
+    assert creates, "przy wylaczonym automacie zostaje powiadomienie jak dotad"
+
+
+@_z_komenda_restartu
+def test_reboot_clears_command_dedup():
+    # REGRESJA DO UNIKNIECIA: po restarcie wallbox nie pamieta naszego STARTu
+    # ani zadanego pradu. Gdyby dedup zostal, skrypt uznalby, ze komendy juz
+    # wyslal, i cisza trwalaby dalej — tyle ze po restarcie.
+    c = make_ctrl()
+    c._last_sent_switch  = True
+    c._last_sent_current = 10
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1)
+    assert _reboots(c), "warunek wstepny: restart mial pojsc"
+    assert c._last_sent_switch is None, "po restarcie dedup switcha ma byc skasowany"
+    assert c._last_sent_current == -1, "po restarcie dedup pradu ma byc skasowany"
+
+
+@_z_komenda_restartu
+def test_reboot_attempts_reset_after_healthy_period():
+    # Trzy restarty rozlozone na miesiac nie moga wyczerpac limitu na zawsze.
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1)
+    assert c._reboot_attempts == 1
+    for i in range(ev.REBOOT_ATTEMPTS_RESET_ITERS + 2):
+        c._update_health(charger("WORKING", power_w=3700,
+                                 metrics_raw=live_raw(2430 + i % 7, amps=60,
+                                                      watts=37)), "SOLAR")
+    assert c._reboot_attempts == 0, "po godzinie zdrowej pracy licznik ma ruszyc od zera"
+
+
+def test_without_known_command_behaves_as_before():
+    # Stan na dzis: kod DP restartu nie jest jeszcze potwierdzony na urzadzeniu.
+    # Mechanizm ma wtedy dzialac dokladnie jak przed zmiana — wykryc i zawolac
+    # czlowieka — a nie udawac, ze cos naprawil.
+    assert ev.REBOOT_DP is None, "produkcyjnie komenda jest nieustalona"
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 3)
+    creates = [s for s, _ in c.service_calls if s == "persistent_notification/create"]
+    assert len(creates) == 1, "ma zostac dokladnie jedno powiadomienie na epizod"
+    assert _pushes(c), "alarm ma isc rowniez na telefon"
+    assert not c._device.calls, "bez znanej komendy nie wolno nic wysylac do wallboxa"
+
+
+# ── Profilaktyczny restart nocny ─────────────────────────────────────────────
+def _o_godzinie(h, dzien="2026-08-20"):
+    """Podmienia zegar modulu na konkretna godzine."""
+    import datetime as _dt
+    teraz = _dt.datetime.strptime(f"{dzien} {h:02d}:05:00", "%Y-%m-%d %H:%M:%S")
+
+    class _DT(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return teraz
+
+    return types.SimpleNamespace(datetime=_DT, timedelta=_dt.timedelta)
+
+
+@_z_komenda_restartu
+def test_nightly_reboot_runs_once_per_day():
+    # Petla chodzi co 30 s, wiec w oknie godziny 4:00 wypada 120 iteracji.
+    # Bez znacznika dnia byloby 120 restartow zamiast jednego.
+    c = make_ctrl()
+    stary_zegar = ev.datetime
+    ev.datetime = _o_godzinie(ev.REBOOT_NIGHTLY_HOUR, dzien="2026-08-21")
+    try:
+        c._last_nightly_reboot_day = ""
+        for _ in range(5):
+            c._maybe_nightly_reboot(charger("PAUSE"))
+        assert len(_reboots(c)) == 1, \
+            f"profilaktyka ma pojsc raz na dobe, poszla {len(_reboots(c))}x"
+    finally:
+        ev.datetime = stary_zegar
+
+
+@_z_komenda_restartu
+def test_nightly_reboot_survives_appdaemon_restart():
+    # Znacznik dnia jest trwaly celowo: restart AppDaemona (albo NAS-a) o 4:15
+    # nie moze wywolac drugiej profilaktyki tej samej nocy.
+    stary_zegar = ev.datetime
+    ev.datetime = _o_godzinie(ev.REBOOT_NIGHTLY_HOUR, dzien="2026-08-22")
+    try:
+        c = make_ctrl()
+        c._last_nightly_reboot_day = ""
+        c._maybe_nightly_reboot(charger("PAUSE"))
+        assert len(_reboots(c)) == 1, "warunek wstepny: pierwsza profilaktyka"
+
+        po_restarcie = make_ctrl()          # nowy proces, stan z pliku
+        po_restarcie._maybe_nightly_reboot(charger("PAUSE"))
+        assert not _reboots(po_restarcie), \
+            "po restarcie AppDaemona profilaktyka nie moze pojsc drugi raz tej nocy"
+    finally:
+        ev.datetime = stary_zegar
+
+
+@_z_komenda_restartu
+def test_nightly_reboot_skips_other_hours():
+    c = make_ctrl()
+    stary_zegar = ev.datetime
+    ev.datetime = _o_godzinie((ev.REBOOT_NIGHTLY_HOUR + 6) % 24)
+    try:
+        c._maybe_nightly_reboot(charger("PAUSE"))
+        assert not _reboots(c), "poza wyznaczona godzina profilaktyka ma spac"
+    finally:
+        ev.datetime = stary_zegar
+
+
+@_z_komenda_restartu
+def test_nightly_reboot_never_interrupts_real_charging():
+    # Tryb zimowy laduje 22:00-6:00. Restart w srodku takiej sesji zabralby
+    # auto z ladowania w najtanszych godzinach.
+    c = make_ctrl()
+    stary_zegar = ev.datetime
+    ev.datetime = _o_godzinie(ev.REBOOT_NIGHTLY_HOUR)
+    try:
+        c._maybe_nightly_reboot(charger("WORKING", power_w=6900))
+        assert not _reboots(c), "plynacy prad ma wstrzymac profilaktyke"
+    finally:
+        ev.datetime = stary_zegar
+
+
+@_z_komenda_restartu
+def test_nightly_reboot_fires_on_hung_charger_in_working():
+    # Zawieszony wallbox tez pokazuje WORKING, ale bez poboru — jego akurat
+    # restartowac warto, wiec kryterium jest realny prad, nie sam status.
+    c = make_ctrl()
+    stary_zegar = ev.datetime
+    ev.datetime = _o_godzinie(ev.REBOOT_NIGHTLY_HOUR)
+    try:
+        c._maybe_nightly_reboot(charger("WORKING", power_w=0))
+        assert _reboots(c), "WORKING bez poboru nie chroni przed profilaktyka"
+    finally:
+        ev.datetime = stary_zegar
+
+
+@_z_komenda_restartu
+def test_awaria_2026_08_18_naprawiona_bez_czlowieka():
+    # Pelny scenariusz tamtej awarii, tyle ze z automatem: DP 102 zamrozony
+    # co do bitu, tryb migocze SOLAR/IDLE, status stoi na WORKING.
+    # Realnie: 22,5 h ciszy. Oczekiwanie: restart w kilka minut.
+    c = make_ctrl()
+    restart_po = None
+    for i in range(30):
+        mode = "SOLAR" if i % 4 else "IDLE"
+        c._update_health(charger("WORKING", metrics_raw=FROZEN_RAW), mode)
+        if _reboots(c):
+            restart_po = (i + 1) * ev.UPDATE_INTERVAL_S / 60.0
+            break
+    assert restart_po is not None, "automat musi zareagowac na te awarie"
+    assert restart_po <= 10, f"oczekiwano restartu w ~5 min, jest {restart_po} min"
+
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

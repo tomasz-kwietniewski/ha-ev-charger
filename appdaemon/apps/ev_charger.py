@@ -32,6 +32,25 @@ DP_STATUS  = 109
 DP_CURRENT = 150
 DP_METRICS = 102
 DP_SWITCH  = 140
+DP_CHARGER_INFO = 106   # tabliczka + napięcie Control Pilot (pole "cp")
+
+# --- Wykrywanie podłączonego auta (naprawa 2026-08-25) ---
+# Powód: 25.08 auto stało odpięte od 10:25 do 15:34, a skrypt przez ten czas
+# wysłał 72 komendy START do pustego gniazda i wygenerował DWA FAŁSZYWE ALARMY
+# o awarii (pierwszy wisiał 5 godzin). Statusy IDLE i SLEEP figurowały w
+# CHARGER_READY_STATES jako "gotowy do ładowania", a znaczą dokładnie odwrotnie:
+# wallbox nikogo nie widzi. Fałszywy alarm jest groźniejszy niż zmarnowana
+# energia — powiadomienie, które myli się przy każdym odpiętym aucie w słoneczny
+# dzień, przestaje się czytać, i wtedy przepada to prawdziwe.
+CP_CONNECTED_MAX_V = 10.0   # [V] poniżej = auto podłączone (patrz _car_connected)
+#
+# ZNANE OGRANICZENIE: gdyby zawieszenie zamroziło samo napięcie CP na wartości
+# "brak auta", skrypt uwierzy wallboxowi i po podłączeniu auta nie zrobi nic ani
+# nie zaalarmuje. Rozważałem siatkę czasową (alarm po godzinie mimo braku auta),
+# ale odrzuciłem: DP 102 przy odpiętym aucie realnie stoi godzinami (25.08 ten
+# sam odczyt trwał od 10:30 do 15:32), więc taka siatka produkowałaby dokładnie
+# te fałszywe alarmy, które ta zmiana usuwa. Świadomie zostawiam ten scenariusz
+# niepokryty — jest hipotetyczny, a fałszywy alarm był realny i kosztowny.
 
 # --- Progi SOC baterii ---
 SOC_THRESHOLD     = 95   # [%] poniżej - nie ładuj auta (ochrona baterii)
@@ -300,6 +319,10 @@ class EVChargerControl(hass.Hass):
         self._iters_since_active_mode = HEALTH_ACTIVE_GRACE_ITERS + 1
         self._unresponsive_cmds      = 0
         self._health_notified        = False
+        # Czy auto jest na końcu kabla (z napięcia Control Pilot). None = jeszcze
+        # nie wiadomo. Trzyma stan między iteracjami, bo _is_charger_frozen musi
+        # wiedzieć, czy stojący pomiar to awaria, czy zwyczajnie puste gniazdo.
+        self._last_car_connected     = None
         # --- Automatyczny restart (awaria 2026-08-18/19) ---
         self._reboot_attempts        = 0
         self._reboot_cooldown        = 0   # iteracje do następnej dozwolonej próby
@@ -494,6 +517,18 @@ class EVChargerControl(hass.Hass):
         2. Komendy bez efektu — wallbox potwierdza wysyłkę, ale status się nie
            zmienia, niezależnie czy prosimy o START czy o STOP.
         """
+        # Stan podłączenia auta — potrzebny w _is_charger_frozen, a przy okazji
+        # w logu widać wreszcie, o której kabel wszedł i wyszedł. Do 25.08.2026
+        # trzeba to było zgadywać z pośrednich objawów.
+        polaczone = charger_data.get("car_connected")
+        if polaczone != self._last_car_connected:
+            cp = charger_data.get("cp_volts")
+            if polaczone is True:
+                self.log(f"Auto podlaczone do ladowarki (Control Pilot {cp}V)")
+            elif polaczone is False:
+                self.log(f"Auto odlaczone od ladowarki (Control Pilot {cp}V)")
+            self._last_car_connected = polaczone
+
         if mode in ACTIVE_CHARGING_MODES:
             self._iters_since_active_mode = 0
         else:
@@ -593,7 +628,14 @@ class EVChargerControl(hass.Hass):
         Drugi warunek odsiewa spokojny postój (auto odpięte, noc) — wtedy stały
         DP 102 niczego złego nie oznacza. Okno HEALTH_ACTIVE_GRACE_ITERS zamiast
         "tryb aktywny teraz", bo tryb potrafi migotać przy nadwyżce na granicy.
+
+        Trzeci warunek to nauczka z 25.08.2026: przy odpiętym aucie pomiar stoi
+        z definicji, bo prąd nie płynie. Tamtego dnia dało to dwa fałszywe
+        alarmy, pierwszy wiszący pięć godzin — skrypt "chciał ładować" (bo IDLE
+        uchodziło za gotowość), więc okno tolerancji nigdy nie wygasło.
         """
+        if self._last_car_connected is False:
+            return False
         return (self._frozen_metrics_streak >= FROZEN_METRICS_THRESHOLD
                 and self._iters_since_active_mode <= HEALTH_ACTIVE_GRACE_ITERS)
 
@@ -780,11 +822,14 @@ class EVChargerControl(hass.Hass):
             p2 = l2[2] if len(l2) > 2 else 0
             p3 = l3[2] if len(l3) > 2 else 0
             power_w = (p1 + p2 + p3) * 100 if status in CHARGER_WORKING_STATES else 0
+            cp_volts = self._read_cp_volts(dps.get(str(DP_CHARGER_INFO), "{}"))
             self._device_error_count = 0
             return {"status": status, "current_a": current, "power_w": power_w,
                     "metrics": metrics, "online": True,
                     "schedule": schedule_raw, "switch": switch_raw,
-                    "metrics_raw": metrics_raw}
+                    "metrics_raw": metrics_raw,
+                    "cp_volts": cp_volts,
+                    "car_connected": self._car_connected(cp_volts)}
         except Exception as e:
             self._device_error_count += 1
             if self._device_error_count <= 3:
@@ -792,7 +837,36 @@ class EVChargerControl(hass.Hass):
             return {"status": "offline", "current_a": 0, "power_w": 0,
                     "metrics": {}, "online": False,
                     "schedule": None, "switch": None,
-                    "metrics_raw": None}
+                    "metrics_raw": None,
+                    "cp_volts": None, "car_connected": None}
+
+    @staticmethod
+    def _read_cp_volts(charger_info_raw):
+        """Napięcie Control Pilot [V] z DP 106, albo None gdy nie da się odczytać."""
+        try:
+            info = (json.loads(charger_info_raw)
+                    if isinstance(charger_info_raw, str) else charger_info_raw)
+            cp = info.get("cp")
+            return float(cp) if cp not in (None, "") else None
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def _car_connected(cp_volts):
+        """Czy auto siedzi na końcu kabla. None = nie wiadomo.
+
+        Wallbox mówi to wprost napięciem Control Pilot (stany wg IEC 61851),
+        tylko dotąd tego nie czytaliśmy — zmierzone na tym egzemplarzu:
+        11,7 V = brak auta (stan A), 8,6 V = podłączone (B), 5,6 V = ładuje (C).
+        Próg w połowie między A i B, więc szum kilkuset miliwoltów nic nie zmienia.
+
+        None zwracamy, gdy odczyt zawiódł — i wtedy NIE blokujemy ładowania.
+        Brak danych nie może unieruchomić sterowania; gorzej wysłać zbędną
+        komendę niż przegapić realną nadwyżkę.
+        """
+        if cp_volts is None:
+            return None
+        return cp_volts < CP_CONNECTED_MAX_V
 
     def _get_ha_data(self, charger_data):
         def safe_float(entity_id, default=0.0):
@@ -862,7 +936,14 @@ class EVChargerControl(hass.Hass):
 
         charger_status = charger_data["status"]
 
-        # Auto niepodłączone
+        # Auto niepodłączone — wallbox mówi to wprost napięciem Control Pilot.
+        # Statusy IDLE/SLEEP tego nie rozstrzygają (znaczą "nie widzę auta", ale
+        # siedzą w CHARGER_READY_STATES), więc bez tego warunku skrypt startował
+        # ładowanie do pustego gniazda: 25.08.2026 zrobił tak 72 razy.
+        if charger_data.get("car_connected") is False:
+            return ("IDLE", 0)
+
+        # Status spoza obu zbiorów — nieznany stan urządzenia
         if (charger_status not in CHARGER_READY_STATES
                 and charger_status not in CHARGER_WORKING_STATES):
             return ("IDLE", 0)

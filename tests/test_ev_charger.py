@@ -144,11 +144,21 @@ def set_env(c, pv, load, pcc, soc=100.0, price=1.0):
     })
 
 
+# Napiecia Control Pilot zmierzone na tym egzemplarzu (2026-08-20/25).
+CP_ODPIETE   = 11.7   # stan A
+CP_PODLACZONE = 8.6   # stan B
+CP_LADUJE     = 5.6   # stan C
+
+
 def charger(status="SLEEP", power_w=0, online=True, metrics_raw=None,
-            current_a=0, schedule=None):
+            current_a=0, schedule=None, cp_volts=CP_PODLACZONE):
+    """Domyslnie auto PODLACZONE - inaczej kazdy istniejacy test musialby
+    o tym pamietac, a sprawdzaja co innego."""
+    car = None if cp_volts is None else cp_volts < ev.CP_CONNECTED_MAX_V
     return {"status": status, "current_a": current_a, "power_w": power_w,
             "metrics": {}, "online": online, "schedule": schedule, "switch": None,
-            "metrics_raw": metrics_raw}
+            "metrics_raw": metrics_raw,
+            "cp_volts": cp_volts, "car_connected": car}
 
 
 # Realna próbka zamrożonego DP 102 z awarii 2026-08-11 (identyczna przez 36 h)
@@ -769,6 +779,90 @@ def test_awaria_2026_08_11_wykryta_w_kilka_minut():
             break
     assert wykryto_po is not None, "awaria musi zostac wykryta"
     assert wykryto_po <= 10, f"oczekiwano wykrycia w ~5 min, jest {wykryto_po} min"
+
+
+# ── Wykrywanie podlaczonego auta (awaria 2026-08-25) ────────────────────────
+# 25.08 auto stalo odpiete od 10:25 do 15:34. Skrypt wyslal w tym czasie 72
+# komendy START do pustego gniazda i wygenerowal DWA FALSZYWE ALARMY o awarii,
+# z ktorych pierwszy wisial piec godzin. Fałszywy alarm jest grozniejszy niz
+# zmarnowana energia: powiadomienie, ktore myli sie regularnie, przestaje byc
+# czytane - i wtedy przepada to prawdziwe.
+
+def test_cp_rozpoznaje_stan_kabla():
+    assert ev.EVChargerControl._car_connected(CP_ODPIETE) is False
+    assert ev.EVChargerControl._car_connected(CP_PODLACZONE) is True
+    assert ev.EVChargerControl._car_connected(CP_LADUJE) is True
+
+
+def test_cp_parsowanie_z_dp106():
+    czytaj = ev.EVChargerControl._read_cp_volts
+    realny = ('{"r":"Type B, AC 30mA + DC 6mA","fv":"2.9.4","cp":"11.7",'
+              '"t":"850","e":"12246"}')
+    assert czytaj(realny) == 11.7
+    assert czytaj('{"fv":"2.9.4"}') is None, "brak pola cp to None, nie wyjatek"
+    assert czytaj("nie-json") is None
+    assert czytaj(None) is None
+
+
+def test_brak_auta_blokuje_start():
+    # REGRESJA 25.08: 72 komendy START do pustego gniazda przy nadwyzce 5-8 kW.
+    c = make_ctrl()
+    set_env(c, pv=8.0, load=0.5, pcc=7.0)
+    mode, target = c._decide(ha_data(surplus_w=8000), charger("IDLE", cp_volts=CP_ODPIETE))
+    assert mode == "IDLE", f"bez auta nie ma czego ladowac, a tryb wyszedl {mode}"
+    assert target == 0
+
+
+def test_brak_auta_nie_wysyla_zadnej_komendy():
+    c = make_ctrl()
+    for _ in range(30):
+        c._apply_decision("IDLE", 0, charger("IDLE", cp_volts=CP_ODPIETE))
+    assert not c._device.switch_sends(), \
+        f"do pustego gniazda nie leci nic, poszlo {len(c._device.switch_sends())} komend"
+
+
+def test_brak_auta_nie_alarmuje_o_awarii():
+    # To jest ten falszywy alarm z 25.08 10:30, ktory wisial 5 godzin.
+    c = make_ctrl()
+    for _ in range(ev.FROZEN_METRICS_THRESHOLD * 3):
+        c._update_health(charger("IDLE", metrics_raw=FROZEN_RAW,
+                                 cp_volts=CP_ODPIETE), "SOLAR")
+    assert not c._is_charger_frozen(), \
+        "stojacy pomiar przy odpietym aucie to norma, nie awaria"
+    creates = [s for s, _ in c.service_calls if s == "persistent_notification/create"]
+    assert not creates, f"nie moze powstac powiadomienie, jest {len(creates)}"
+    assert not _pushes(c), "i zadnego pusha na telefon"
+
+
+def test_podlaczone_auto_nadal_alarmuje():
+    # Druga strona medalu: prawdziwa awaria ma byc wykryta jak dotad.
+    c = make_ctrl()
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD + 1)   # helper: auto podlaczone
+    assert c._is_charger_frozen(), "z podlaczonym autem zamrozony pomiar to awaria"
+    creates = [s for s, _ in c.service_calls if s == "persistent_notification/create"]
+    assert creates, "i ma o niej powiadomic"
+
+
+def test_nieznane_cp_nie_blokuje_ladowania():
+    # Brak danych nie moze unieruchomic sterowania - gorzej wyslac zbedna
+    # komende niz przegapic realna nadwyzke.
+    c = make_ctrl()
+    set_env(c, pv=8.0, load=0.5, pcc=5.0)
+    mode, target = c._decide(ha_data(surplus_w=5000), charger("PAUSE", cp_volts=None))
+    assert mode == "SOLAR", f"przy nieznanym cp dzialamy jak dotad, wyszlo {mode}"
+    assert target >= ev.MIN_CURRENT_A
+
+
+def test_odlaczenie_auta_w_trakcie_ladowania():
+    # Kabel wyciagniety przy pracujacej sesji: przestajemy sterowac.
+    c = make_ctrl()
+    set_env(c, pv=8.0, load=0.5, pcc=5.0)
+    mode, _ = c._decide(ha_data(surplus_w=5000), charger("WORKING", power_w=4000,
+                                                         cp_volts=CP_LADUJE))
+    assert mode == "SOLAR", "warunek wstepny: z autem ladujemy"
+    mode, target = c._decide(ha_data(surplus_w=5000), charger("WORKING", power_w=0,
+                                                              cp_volts=CP_ODPIETE))
+    assert mode == "IDLE" and target == 0, "po wypieciu kabla schodzimy do IDLE"
 
 
 def test_idleins_counts_as_car_connected():

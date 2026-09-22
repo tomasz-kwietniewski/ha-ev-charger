@@ -8,14 +8,25 @@ Skrypt AppDaemon steruje ładowarką EV (protokół Tuya 3.5) lokalnie przez sie
 
 | Tryb | Warunek | Działanie |
 |------|---------|-----------|
-| `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen |
+| `MANUAL` | Automatyka wyłączona (`input_boolean.ev_automatyka` = off, suwak w nagłówku karty) | Skrypt nie wysyła do ładowarki **nic** - sterujesz ze Smart Life albo przyciskiem na wallboxie. Pomiary i liczniki energii dalej się aktualizują |
+| `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen - ale nie przy SOC magazynu poniżej 20% (`SOC_EMERGENCY_MIN`) |
 | `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na 13A (~9 kW, bufor ~2 kW na dom przy przyłączu 11 kW) |
 | `WINTER_NIGHT` | Tryb zimowy włączony, godz. 22–6 | Ładuj na 10A (tania taryfa nocna) |
 | `SOLAR` | SOC baterii ≥ 95% i nadwyżka ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A); nadwyżka = min(eksport PCC, PV − zużycie domu) + bias |
 | `BATTERY_PRIORITY` | SOC < 95% | Czekaj, priorytet ładowania baterii |
 | `IDLE` | Brak nadwyżek lub auto niepodłączone | Ładowarka wyłączona |
 
-Tryby sprawdzane są w kolejności od góry — EMERGENCY ma najwyższy priorytet.
+Tryby sprawdzane są w kolejności od góry. Wyłącznik automatyki ma pierwszeństwo przed wszystkim, a spośród trybów automatycznych najwyższy priorytet ma EMERGENCY.
+
+### Sterowanie ręczne - wyłącznik automatyki
+
+Jesienią, przy słabym słońcu, auto trzeba czasem po prostu naładować. Tryb awaryjny tego nie załatwia, gdy magazyn domowy ma mniej niż 20% (skrypt chroni go przed drenażem), a ładowanie uruchomione ręcznie ze Smart Life skrypt zatrzymywał STOPem w ciągu 30 sekund. Dlatego jest wyłącznik:
+
+- **Wyłączony** - skrypt nie wysyła do wallboxa niczego: ani START/STOP, ani prądu, nie czyści harmonogramu ustawionego w Smart Life, nie restartuje urządzenia i nie alarmuje. Tylko mierzy. Tryb awaryjny gaśnie razem z automatyką, żeby nie odpalił się sam godziny później. Sesja uruchomiona z aplikacji liczy energię od zera.
+- **Włączony** - skrypt od razu (nie za 30 s) przejmuje stery i zapomina, co wysłał przed przerwą, bo prąd i START/STOP mogły zostać zmienione w aplikacji. Uwaga: przy SOC < 95% i braku nadwyżki oznacza to STOP ręcznie uruchomionej sesji.
+- Brak encji `input_boolean.ev_automatyka` oznacza „włączona" - kod działa jak dawniej, zanim pomocnik powstanie.
+
+Przy wyłączonej automatyce skrypt nie chroni magazynu domowego - falownik może pokrywać pobór auta z baterii aż do własnego progu rozładowania.
 
 ## Instalacja
 
@@ -80,6 +91,7 @@ Utwórz przez UI (Settings → Helpers) — **nie przez YAML**:
 | Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (min: 0,5 / max: 8 / step: 0,5 / unit: h) |
 | Button | `input_button.ev_archiwizuj_teraz` | Ręczna archiwizacja bieżącego miesiąca (opcjonalny, do testów/podglądu) |
 | Toggle | `input_boolean.ev_auto_restart` | Automatyczny restart zawieszonego wallboxa (opcjonalny — brak encji oznacza „włączone") |
+| Toggle | `input_boolean.ev_automatyka` | Wyłącznik automatyki: off = skrypt nie steruje ładowarką (opcjonalny - brak encji oznacza „włączona") |
 
 ### Krok 5 — Template sensory i utility meters
 
@@ -97,6 +109,35 @@ Tworzone są m.in.:
 ### Krok 6 — Dashboard
 
 Dla archiwum miesiąc do miesiąca dodaj karty z `homeassistant/lovelace_ev_history_card.yaml` (wykres słupkowy + tabela + przycisk ręcznej archiwizacji). Wykres słupkowy wymaga karty `apexcharts-card` z HACS; tabela Markdown działa natywnie, bez HACS.
+
+**Wyłącznik automatyki w nagłówku karty.** Suwak w nagłówku karty `entities` przełącza **wszystkie** przełączniki z karty naraz - u mnie był więc kopią „Ładuj na maksa" i „Tryb zimowy", a włączony włączał oba tryby jednocześnie. Frontend HA bierze do niego tylko wiersze z kluczem `entity` na najwyższym poziomie (sprawdzone w źródle `hui-entities-card.ts`, frontend 20260826.6). Wystarczy więc zostawić tam jedynie wyłącznik, a pozostałe przełączniki owinąć w wiersz warunkowy, który przy okazji chowa je, gdy automatyka jest wyłączona - i tak nic by wtedy nie robiły:
+
+```yaml
+type: entities
+title: System EV i Magazyn
+show_header_toggle: true          # przy jednym przełączniku domyślnie byłby ukryty
+entities:
+  - type: simple-entity           # podpis pod suwakiem; stan zamiast drugiego przełącznika
+    entity: input_boolean.ev_automatyka
+    name: Automat ładowania
+  # ... sensory ...
+  - type: conditional             # brak "entity" na górze = suwak nagłówka go nie widzi
+    conditions:
+      - condition: state
+        entity: input_boolean.ev_automatyka
+        state: "on"
+    row:
+      entity: input_boolean.ev_tryb_awaryjny
+      name: ⚡ Ładuj na maksa
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_boolean.ev_automatyka
+        state: "on"
+    row:
+      entity: input_boolean.ev_tryb_zimowy
+      name: ❄️ Tryb zimowy (ładowanie nocne 22-6)
+```
 
 Panel sterowania (toggle trybu awaryjnego/zimowego, status, statystyki) złóż z sensorów opisowych (`sensor.ev_status_opis`, `sensor.ev_tryb_opis`, `sensor.ev_moc_ladowania` itd.) w dowolnej karcie Entities — repo nie narzuca gotowego layoutu.
 
@@ -218,6 +259,8 @@ ha-ev-charger/
 - **Ręczny Reboot ze Smart Life nie restartuje całego urządzenia** — moduł WiFi/Tuya pracuje nieprzerwanie (nasłuch co 0,7 s nie zanotował ani jednej przerwy), resetowany jest wyłącznie moduł mocy. Sygnatura: `cp` w DP 106 spada z ~11,7 V do 0,0 V i wraca po ~3 sekundach. To pole to **napięcie Control Pilot**, nie wersja firmware: ~12 V = brak auta, ~9 V = podłączone, ~6 V = ładowanie
 - **`IDLE` i `SLEEP` znaczą „nie widzę auta", a nie „gotowy do ładowania"** — i to jest najdroższa pomyłka w tym projekcie. 25.08.2026 auto stało odpięte od 10:25 do 15:34, a skrypt wysłał w tym czasie **72 komendy START do pustego gniazda** i rzucił **dwa fałszywe alarmy o awarii** (pierwszy wisiał pięć godzin). Watchdog zadziałał zgodnie z literą kodu: skrypt „chciał ładować", pomiar stał w miejscu (bo prąd nie płynął), więc uznał zawieszenie. **Fałszywy alarm jest groźniejszy niż zmarnowana energia** — powiadomienie mylące się przy każdym odpiętym aucie w słoneczny dzień przestaje być czytane, i wtedy przepada to prawdziwe
 - **Rozstrzyga napięcie Control Pilot, nie status** — wallbox cały czas mówi, czy kabel siedzi w aucie (pole `cp` w DP 106). Próg `CP_CONNECTED_MAX_V` = 10 V leży w połowie między stanem A (~11,7 V, brak auta) i B (~8,6 V, podłączone). Gdy `cp` nie da się odczytać, skrypt zachowuje się jak dawniej — brak danych nie może zablokować ładowania
+- **Tryb awaryjny ma próg SOC magazynu** - poniżej `SOC_EMERGENCY_MIN` (20%) nie ładuje, choć przełącznik świeci na „włączony", a na dashboardzie widać „Priorytet baterii". 22.09.2026 tak właśnie nie dało się naładować auta, a ładowanie uruchomione ręcznie skrypt zatrzymywał. Na takie sytuacje jest wyłącznik automatyki
+- **Suwak w nagłówku karty `entities` to nie wyłącznik, tylko „przełącz wszystko"** - obejmuje każdy przełącznik z karty; jak zrobić z niego wyłącznik jednej encji, opisuje Krok 6
 - **Tryb awaryjny nie przeżywa restartu AppDaemona** — `_emergency_end_time` żyje tylko w pamięci, więc po restarcie (także po każdym `deploy.sh`) `_is_emergency_active()` gasi `input_boolean` i tryb przepada. Przed wdrożeniem w trakcie trwania trybu awaryjnego trzeba poczekać albo liczyć się z przerwaniem ładowania
 - **Status `IDLEINS`** — stan przejściowy przy starcie sesji (`PAUSE → IDLE → IDLEINS → WORKING`, trwa ok. 9 s, znaczy „kabel włożony"). Nie był na żadnej liście stanów, więc `_decide()` widział go jako „auto niepodłączone", a zawieszenie w tym stanie byłoby dla watchdoga niewidoczne. Naprawione 20.08.2026
 - **Status `WORKING` to deklaracja, nie fakt** — znaczy tylko tyle, że wallbox ma otwartą sesję, nie że auto pobiera prąd. Nie używać go jako jedynego dowodu, że ładowanie trwa; konfrontować ze świeżością danych, sprzężeniem zwrotnym z komend (DP 150) i realnym przepływem mocy
@@ -253,7 +296,7 @@ Lekki runner bez zewnętrznych zależności (stubuje AppDaemon, TinyTuya i `requ
 python tests/test_ev_charger.py
 ```
 
-Pokrywa logikę decyzyjną (`_decide`, `_surplus_to_current`), liczenie nadwyżki przy deficycie i maskowaniu przez magazyn, ponowienia komend START/STOP, detekcję błędów TinyTuya, atomowość persystencji, limit 255 znaków `input_text.ev_data`, a także wykrywanie zawieszonego wallboxa, cykl budzenia sesji i weryfikację zadanego prądu. `./deploy.sh` uruchamia je automatycznie i przerywa wdrożenie, gdy któryś nie przejdzie.
+Pokrywa logikę decyzyjną (`_decide`, `_surplus_to_current`), liczenie nadwyżki przy deficycie i maskowaniu przez magazyn, ponowienia komend START/STOP, detekcję błędów TinyTuya, atomowość persystencji, limit 255 znaków `input_text.ev_data`, a także wykrywanie zawieszonego wallboxa, cykl budzenia sesji, weryfikację zadanego prądu i wyłącznik automatyki (zero komend przy sterowaniu ręcznym, natychmiastowy powrót sterowania). `./deploy.sh` uruchamia je automatycznie i przerywa wdrożenie, gdy któryś nie przejdzie.
 
 Każdy test regresyjny nosi w komentarzu datę i opis zdarzenia, które go wymusiło — dzięki temu widać, przed czym konkretnie chroni dana asercja.
 

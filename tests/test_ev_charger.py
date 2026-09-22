@@ -1135,6 +1135,192 @@ def test_awaria_2026_08_18_naprawiona_bez_czlowieka():
 
 
 # ── Runner ───────────────────────────────────────────────────────────────────
+# ── Wylacznik automatyki (2026-09-22) ───────────────────────────────────────
+# Kontekst: 22.09 rano magazyn mial 18% SOC, tryb awaryjny byl wlaczony, ale
+# wstrzymany progiem SOC_EMERGENCY_MIN. Ladowanie uruchomione recznie ze Smart
+# Life (07:34, 7,9 kW) skrypt zatrzymal STOPem w 30 sekund - dwa razy z rzedu.
+# Nie bylo zadnego sposobu, zeby powiedziec skryptowi "teraz steruje ja".
+
+def _reczna_sesja(c, watts=26, prad=16):
+    """Wallbox laduje z reki: WORKING, ~7,8 kW, auto podlaczone, prad z aplikacji."""
+    c._device.status_response = {"dps": {
+        "109": "working", "150": prad, "102": live_raw(watts=watts),
+        "106": json.dumps({"cp": str(CP_LADUJE)})}}
+
+
+def _tryb_na_dashboardzie(c):
+    tryby = [kw["value"] for s, kw in c.service_calls
+             if s == "input_text/set_value"
+             and kw.get("entity_id") == "input_text.ev_charger_mode"]
+    return tryby[-1] if tryby else None
+
+
+def test_automatyka_wylaczona_nie_zatrzymuje_recznej_sesji():
+    # REGRESJA 22.09 07:34: SOC 18%, reczny START ze Smart Life, skrypt STOP.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off"})
+    set_env(c, pv=0.2, load=8.5, pcc=-8.3, soc=18.0)
+    _reczna_sesja(c)
+    for _ in range(10):
+        c._main_loop({})
+    assert not c._device.calls, \
+        f"przy wylaczonej automatyce do wallboxa nie leci nic, poszlo: {c._device.calls}"
+    assert _tryb_na_dashboardzie(c) == ev.MANUAL_MODE, \
+        f"dashboard ma pokazac sterowanie reczne, pokazuje {_tryb_na_dashboardzie(c)}"
+
+
+def test_ta_sama_sytuacja_z_wlaczona_automatyka_stopuje():
+    # Kontrprzyklad dla testu wyzej: to jest zachowanie z 22.09, ktore
+    # przy wlaczonej automatyce zostaje (ochrona magazynu przy niskim SOC).
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "on"})
+    set_env(c, pv=0.2, load=8.5, pcc=-8.3, soc=18.0)
+    _reczna_sesja(c)
+    c._main_loop({})
+    assert (str(ev.DP_SWITCH), False) in c._device.calls, \
+        "z automatyka skrypt nadal zatrzymuje ladowanie przy SOC 18%"
+
+
+def test_brak_encji_automatyki_znaczy_wlaczona():
+    # Kod wdrozony przed utworzeniem pomocnika w HA ma dzialac jak dotad.
+    c = make_ctrl()
+    set_env(c, pv=8.0, load=0.5, pcc=5.0)
+    mode, _ = c._decide(ha_data(surplus_w=5000), charger("PAUSE"))
+    assert mode == "SOLAR", f"brak encji to automatyka wlaczona, wyszlo {mode}"
+
+
+def test_automatyka_wylaczona_wygrywa_z_kazdym_trybem():
+    # Awaryjny, ujemna cena i noc zimowa naraz - wylacznik ma pierwszenstwo.
+    import datetime as _dt
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off", ev.EMERGENCY_MODE_ENTITY: "on",
+                   ev.WINTER_MODE_ENTITY: "on"})
+    c._emergency_end_time = _dt.datetime.now() + _dt.timedelta(hours=2)
+    mode, target = c._decide(ha_data(surplus_w=9000, soc=100.0, price=-0.5),
+                             charger("PAUSE"))
+    assert (mode, target) == (ev.MANUAL_MODE, 0), f"wyszlo {mode}/{target}"
+
+
+def test_automatyka_wylaczona_nie_czysci_harmonogramu():
+    # Harmonogram ustawiony w Smart Life przy recznym sterowaniu to decyzja
+    # czlowieka, a nie smiec wepchniety przez chmure.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off"})
+    for _ in range(3):
+        c._update_diag(charger("PAUSE",
+                               schedule='{"m":1,"dt":0,"ss":"22:00","se":"06:00"}'),
+                       ev.MANUAL_MODE)
+    assert not c._device.calls, f"harmonogram ma zostac nietkniety: {c._device.calls}"
+
+
+@_z_komenda_restartu
+def test_automatyka_wylaczona_nie_alarmuje_i_nie_restartuje():
+    # Chwile przed wylaczeniem skrypt ladowal (okno tolerancji wciaz otwarte),
+    # a pomiar stoi. Bez wylacznika to bylby alarm i restart w trakcie
+    # recznej sesji - dokladnie tego czlowiek przy sterach nie chce.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off"})
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD - 2, mode="SOLAR")
+    _pump_health(c, ev.FROZEN_METRICS_THRESHOLD * 2, mode=ev.MANUAL_MODE)
+    assert not _reboots(c), "bez restartow przy recznym sterowaniu"
+    assert not _pushes(c), "i bez pushy"
+    creates = [s for s, _ in c.service_calls if s == "persistent_notification/create"]
+    assert not creates, "i bez powiadomien w panelu"
+
+
+@_z_komenda_restartu
+def test_automatyka_wylaczona_bez_restartu_nocnego():
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off"})
+    stary_zegar = ev.datetime
+    ev.datetime = _o_godzinie(ev.REBOOT_NIGHTLY_HOUR, dzien="2026-09-22")
+    try:
+        c._last_nightly_reboot_day = ""
+        c._maybe_nightly_reboot(charger("PAUSE"), ev.MANUAL_MODE)
+        assert not _reboots(c), "profilaktyka tez czeka na powrot automatyki"
+    finally:
+        ev.datetime = stary_zegar
+
+
+def test_wylaczenie_automatyki_gasi_tryb_awaryjny():
+    # Tryb awaryjny to czesc automatyki. Zostawiony wlaczony odpalilby sie sam
+    # po powrocie automatyki, godziny pozniej, bez niczyjej decyzji.
+    import datetime as _dt
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off", ev.EMERGENCY_MODE_ENTITY: "on"})
+    c._emergency_end_time = _dt.datetime.now() + _dt.timedelta(hours=4)
+    c._on_automation_toggle(ev.AUTOMATION_ENTITY, "state", "on", "off", {})
+    assert ("input_boolean/turn_off", {"entity_id": ev.EMERGENCY_MODE_ENTITY}) \
+        in c.service_calls, "tryb awaryjny ma zgasnac razem z automatyka"
+
+
+def test_wylaczenie_automatyki_dziala_od_razu():
+    # "Natychmiast", nie za 30 s - dashboard od razu pokazuje sterowanie reczne.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off"})
+    c._on_automation_toggle(ev.AUTOMATION_ENTITY, "state", "on", "off", {})
+    assert _tryb_na_dashboardzie(c) == ev.MANUAL_MODE
+
+
+def test_tryb_awaryjny_przy_wylaczonej_automatyce_odbija():
+    # Przelacznik awaryjny klikniety przy recznym sterowaniu nic by nie zrobil,
+    # a udawalby, ze dziala. Wraca na "off", zeby bylo widac, ze nie dziala.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "off", ev.EMERGENCY_MODE_ENTITY: "on"})
+    c._on_emergency_toggle(ev.EMERGENCY_MODE_ENTITY, "state", "off", "on", {})
+    assert ("input_boolean/turn_off", {"entity_id": ev.EMERGENCY_MODE_ENTITY}) \
+        in c.service_calls
+    assert c._emergency_end_time is None
+    assert not c._device.calls, "bez czyszczenia harmonogramu"
+
+
+def test_powrot_automatyki_od_razu_obejmuje_stery_stop():
+    # Przed reczna sesja skrypt sam zatrzymal ladowanie (_last_sent_switch=False).
+    # Bez zapomnienia tego STOP po wlaczeniu automatyki poszedlby dopiero
+    # z cyklu ponowien, czyli po 2 minutach ladowania z magazynu.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "on"})
+    c._last_sent_switch = False
+    set_env(c, pv=0.2, load=8.5, pcc=-8.3, soc=18.0)
+    _reczna_sesja(c)
+    c._on_automation_toggle(ev.AUTOMATION_ENTITY, "state", "off", "on", {})
+    assert (str(ev.DP_SWITCH), False) in c._device.calls, \
+        "SOC 18% i automatyka wraca -> STOP od razu"
+
+
+def test_powrot_automatyki_od_razu_obejmuje_stery_start():
+    # Lustro: skrypt pamieta swoj START sprzed recznej przerwy, a czlowiek
+    # zatrzymal ladowanie w aplikacji. Nadwyzka jest - START ma pojsc od razu.
+    c = make_ctrl({ev.AUTOMATION_ENTITY: "on"})
+    c._last_sent_switch = True
+    c._last_sent_current = 8
+    set_env(c, pv=9.0, load=0.5, pcc=6.0, soc=100.0)
+    c._device.status_response = {"dps": {
+        "109": "pause", "150": 16, "102": live_raw(),
+        "106": json.dumps({"cp": str(CP_PODLACZONE)})}}
+    c._on_automation_toggle(ev.AUTOMATION_ENTITY, "state", "off", "on", {})
+    assert (str(ev.DP_SWITCH), True) in c._device.calls, "START od razu"
+    assert any(dp == str(ev.DP_CURRENT) for dp, _ in c._device.calls), \
+        "prad ustawiony w aplikacji zostaje nadpisany wyliczonym"
+
+
+def test_reczna_sesja_liczy_energie_od_zera():
+    # 22.09 dashboard pokazywal "Energia sesja 53,25 kWh". Sesja zaczyna sie
+    # tylko w _send_start(), wiec przy ladowaniu z reki licznik ciagnalby
+    # energie poprzednich sesji.
+    import datetime as _dt
+    c = make_ctrl()
+    c._current_session_kwh = 53.25
+    c._last_charger_status = "PAUSE"
+    c._last_update_time = _dt.datetime.now() - _dt.timedelta(seconds=30)
+    c._update_energy_counters(charger("WORKING", power_w=7800))
+    assert 0 < c._current_session_kwh < 0.1, \
+        f"nowa sesja liczy od zera, jest {c._current_session_kwh:.3f} kWh"
+
+
+def test_ogon_po_stopie_to_nie_nowa_sesja():
+    # Po naszym STOPie wallbox potrafi ladowac jeszcze ~2 min (25.08). To ta
+    # sama sesja - licznik nie moze sie wtedy wyzerowac.
+    import datetime as _dt
+    c = make_ctrl()
+    c._current_session_kwh = 5.0
+    c._session_start_time = None          # _apply_decision zamknal sesje STOPem
+    c._last_charger_status = "WORKING"
+    c._last_update_time = _dt.datetime.now() - _dt.timedelta(seconds=30)
+    c._update_energy_counters(charger("WORKING", power_w=3800))
+    assert c._current_session_kwh > 5.0, "to ciag dalszy, nie nowa sesja"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

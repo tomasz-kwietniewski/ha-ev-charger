@@ -223,6 +223,19 @@ NOTIFY_SERVICE = "notify/notify"
 # Tryby, w których skrypt świadomie chce ładować.
 ACTIVE_CHARGING_MODES = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
 
+# --- Wyłącznik automatyki (2026-09-22) ---
+# Powód: 22.09 rano magazyn miał 18% SOC, tryb awaryjny był włączony, ale
+# wstrzymany progiem SOC_EMERGENCY_MIN. Ładowanie uruchomione ręcznie ze Smart
+# Life (07:34, 7,9 kW) skrypt zatrzymywał STOPem w 30 sekund. Jesienią, przy
+# słabym słońcu, auto trzeba czasem po prostu naładować - a nie było sposobu,
+# żeby powiedzieć skryptowi "teraz steruję ja".
+# Wyłączony = skrypt nie wysyła do wallboxa NICZEGO (START/STOP, prąd,
+# czyszczenie harmonogramu, restart), tylko mierzy i publikuje dane.
+# Brak encji (get_state -> None) oznacza "włączona" - kod wdrożony przed
+# utworzeniem pomocnika działa jak dotąd.
+AUTOMATION_ENTITY = "input_boolean.ev_automatyka"
+MANUAL_MODE       = "MANUAL"
+
 # --- Tryb zimowy ---
 WINTER_MODE_ENTITY  = "input_boolean.ev_tryb_zimowy"
 WINTER_MAX_CURRENT  = 10
@@ -360,10 +373,58 @@ class EVChargerControl(hass.Hass):
         except Exception as e:
             self.log(f"DIAG INIT: nie udalo sie pobrac pelnego DPS: {e}", level="WARNING")
 
-        self._clear_schedule()
+        if self._automation_enabled():
+            self._clear_schedule()
+        else:
+            self.log(f"Automatyka wylaczona ({AUTOMATION_ENTITY}) - "
+                     f"nie dotykam ladowarki, tylko mierze")
         self.listen_state(self._on_emergency_toggle, EMERGENCY_MODE_ENTITY)
+        self.listen_state(self._on_automation_toggle, AUTOMATION_ENTITY)
         self.run_every(self._main_loop, "now", UPDATE_INTERVAL_S)
         self.log("EV Charger Control zainicjalizowany")
+
+    # ------------------------------------------------------------------
+    # WYŁĄCZNIK AUTOMATYKI
+    # ------------------------------------------------------------------
+
+    def _automation_enabled(self):
+        """Czy skrypt steruje wallboxem. Brak encji (None) znaczy "tak"."""
+        return self.get_state(AUTOMATION_ENTITY) != "off"
+
+    def _on_automation_toggle(self, entity, attribute, old, new, kwargs):
+        if new not in ("on", "off") or new == old:
+            return
+        if new == "off":
+            self.log("AUTOMATYKA WYLACZONA: ladowarka w rekach czlowieka "
+                     "(Smart Life / przycisk). Skrypt nie wysyla zadnych komend.")
+            if self.get_state(EMERGENCY_MODE_ENTITY) == "on":
+                # Tryb awaryjny to część automatyki. Zostawiony włączony
+                # odpaliłby się sam po jej powrocie, bez niczyjej decyzji.
+                self.call_service("input_boolean/turn_off",
+                                  entity_id=EMERGENCY_MODE_ENTITY)
+        else:
+            self.log("AUTOMATYKA WLACZONA: skrypt przejmuje sterowanie ladowarka")
+        # W obie strony pamięć wysłanych komend jest nieaktualna: człowiek
+        # zmieniał prąd i START/STOP w aplikacji. Bez wyzerowania dedup uznałby
+        # po powrocie, że komendy już poszły, i czekał na cykl ponowień.
+        self._forget_sent_commands()
+        # Od razu, nie za 30 s - przełącznik ma działać natychmiast: dashboard
+        # pokazuje nowy tryb, a po włączeniu skrypt od razu obejmuje stery.
+        self._main_loop({})
+
+    def _forget_sent_commands(self):
+        """Zapomnij, co wysłaliśmy wallboxowi - jego stan zmienił się bez nas
+        (restart urządzenia albo ręczne sterowanie z aplikacji)."""
+        self._last_sent_switch       = None
+        self._last_sent_current      = -1
+        self._pending_current        = -1
+        self._pending_iters          = 0
+        self._switch_mismatch_iters  = 0
+        self._current_mismatch_iters = 0
+        self._start_retries          = 0
+        self._stop_retries           = 0
+        self._start_giveup_iters     = 0
+        self._wake_attempts          = 0
 
     # ------------------------------------------------------------------
     # EMERGENCY
@@ -371,6 +432,16 @@ class EVChargerControl(hass.Hass):
 
     def _on_emergency_toggle(self, entity, attribute, old, new, kwargs):
         if new == "on":
+            if not self._automation_enabled():
+                # Nic by nie zrobił, a udawałby, że działa. Odbija na "off",
+                # żeby było widać, że przy ręcznym sterowaniu go nie ma.
+                self.log("Tryb awaryjny zignorowany: automatyka wylaczona. "
+                         "Laduj recznie ze Smart Life albo wlacz automatyke.",
+                         level="WARNING")
+                self._emergency_end_time = None
+                self.call_service("input_boolean/turn_off",
+                                  entity_id=EMERGENCY_MODE_ENTITY)
+                return
             hours = self._get_emergency_hours()
             self._emergency_end_time = datetime.datetime.now() + datetime.timedelta(hours=hours)
             self.log(f"EMERGENCY START: {hours}h, koniec o {self._emergency_end_time.strftime('%H:%M')}")
@@ -415,7 +486,7 @@ class EVChargerControl(hass.Hass):
         self._apply_decision(mode, target_current, charger_data)
         self._update_diag(charger_data, mode)
         self._update_health(charger_data, mode)
-        self._maybe_nightly_reboot(charger_data)
+        self._maybe_nightly_reboot(charger_data, mode)
         self._update_sensors(charger_data, ha_data, mode, target_current)
         self._update_ha_helpers(charger_data, ha_data, mode, target_current)
 
@@ -466,6 +537,11 @@ class EVChargerControl(hass.Hass):
                 f"DIAG: DP151 zmiana: {self._last_schedule_seen!r} -> {schedule_now!r}"
             )
             self._last_schedule_seen = schedule_now
+
+        # Przy ręcznym sterowaniu harmonogram ustawiony w Smart Life to decyzja
+        # człowieka, a nie śmieć wepchnięty przez chmurę - nie ruszamy go.
+        if mode == MANUAL_MODE:
+            return
 
         # Chmura Tuya wpycha harmonogram po każdym reboocie wallboxa
         # (2026-05-21 i 2026-08-11: "ss":"15:00","se":"17:00"). Dotąd czyściliśmy
@@ -528,6 +604,18 @@ class EVChargerControl(hass.Hass):
             elif polaczone is False:
                 self.log(f"Auto odlaczone od ladowarki (Control Pilot {cp}V)")
             self._last_car_connected = polaczone
+
+        if mode == MANUAL_MODE:
+            # Skrypt nie steruje, więc nie ma czego oceniać: stojący pomiar
+            # przy ręcznej sesji to nie powód do restartu, a komend bez efektu
+            # nie ma, bo żadnych nie wysyłamy. Liczniki jak po długim postoju -
+            # po powrocie automatyki diagnostyka startuje od zera, zamiast
+            # alarmować w pierwszej iteracji. Ewentualne wcześniejsze
+            # powiadomienie o awarii zostaje: nie wiemy, czy minęła.
+            self._iters_since_active_mode = HEALTH_ACTIVE_GRACE_ITERS + 1
+            self._frozen_metrics_streak   = 0
+            self._unresponsive_cmds       = 0
+            return
 
         if mode in ACTIVE_CHARGING_MODES:
             self._iters_since_active_mode = 0
@@ -720,24 +808,18 @@ class EVChargerControl(hass.Hass):
         # restartu, jest już nieaktualne — w szczególności dedup komend: po
         # restarcie urządzenie nie pamięta naszego START-u ani zadanego prądu,
         # więc bez wyzerowania skrypt uznałby, że komendy już wysłał, i zamilkł.
+        self._forget_sent_commands()
         self._frozen_metrics_streak     = 0
         self._last_metrics_raw          = None
         self._unresponsive_cmds         = 0
         self._working_zero_power_streak = 0
-        self._wake_attempts             = 0
-        self._start_retries             = 0
-        self._stop_retries              = 0
-        self._switch_mismatch_iters     = 0
-        self._current_mismatch_iters    = 0
-        self._last_sent_switch          = None
-        self._last_sent_current         = -1
         # Chmura Tuya wpycha harmonogram po każdym restarcie (2026-05-21,
         # 2026-08-11, 2026-08-19) — niech licznik czyszczeń ma pełny limit.
         self._schedule_clears           = 0
         self._reboot_cooldown           = REBOOT_COOLDOWN_ITERS
         return True
 
-    def _maybe_nightly_reboot(self, charger_data):
+    def _maybe_nightly_reboot(self, charger_data, mode=None):
         """Profilaktyczny restart raz na dobę — higiena przeciw zawieszeniom.
 
         Nie zastępuje restartu reaktywnego, tylko go uzupełnia: awaria z 18.08
@@ -746,6 +828,8 @@ class EVChargerControl(hass.Hass):
         """
         if REBOOT_NIGHTLY_HOUR is None or REBOOT_DP is None:
             return
+        if mode == MANUAL_MODE:
+            return   # przy ręcznym sterowaniu wallbox należy do człowieka
         if not self._auto_reboot_enabled():
             return
         now = datetime.datetime.now()
@@ -931,6 +1015,11 @@ class EVChargerControl(hass.Hass):
     # ------------------------------------------------------------------
 
     def _decide(self, ha_data, charger_data):
+        # 0. Automatyka wyłączona - steruje człowiek. Przed wszystkim innym,
+        # także przed trybem awaryjnym i zimowym: wyłącznik znaczy "nic".
+        if not self._automation_enabled():
+            return (MANUAL_MODE, 0)
+
         if not charger_data["online"]:
             return ("OFFLINE", 0)
 
@@ -1083,6 +1172,9 @@ class EVChargerControl(hass.Hass):
                 self._start_giveup_iters    = 0
                 self._switch_mismatch_iters = 0
             self._last_charger_status = charger_status
+
+        if mode == MANUAL_MODE:
+            return   # ręczne sterowanie: do wallboxa nie wysyłamy nic
 
         if mode in ACTIVE_CHARGING_MODES:
             if target_current > 0 and target_current != self._last_sent_current:
@@ -1312,6 +1404,19 @@ class EVChargerControl(hass.Hass):
                 "ev_last_ym":          current_ym,
                 "ev_month_energy_kwh": self._month_energy_kwh,
             })
+        # Sesja rozpoczęta bez naszego START-u (Smart Life, przycisk na
+        # wallboxie). Dotąd sesję otwierał tylko _send_start(), więc przy
+        # ładowaniu z ręki licznik ciągnął energię poprzednich sesji (22.09
+        # dashboard pokazywał 53 kWh "sesji"). Zbocze statusu, a nie sam
+        # WORKING: po naszym STOPie wallbox potrafi ładować jeszcze ~2 min,
+        # i to jest ogon tej samej sesji, a nie nowa.
+        if (charger_data["status"] in CHARGER_WORKING_STATES
+                and self._session_start_time is None
+                and self._last_charger_status is not None
+                and self._last_charger_status not in CHARGER_WORKING_STATES):
+            self._session_start_time  = now
+            self._current_session_kwh = 0.0
+            self.log("Nowa sesja bez START-u ze skryptu (Smart Life / przycisk)")
         if self._last_update_time is not None and charger_data["online"]:
             dt_hours   = (now - self._last_update_time).total_seconds() / 3600.0
             energy_kwh = (charger_data["power_w"] * dt_hours) / 1000.0

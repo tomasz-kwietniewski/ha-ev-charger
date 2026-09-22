@@ -155,6 +155,7 @@ template:
           {% elif m == 'EMERGENCY' %}Tryb awaryjny - max moc
           {% elif m == 'BATTERY_PRIORITY' %}Priorytet baterii
           {% elif m == 'WINTER_NIGHT' %}Nocne ladowanie (zima)
+          {% elif m == 'MANUAL' %}Ręcznie (Smart Life)
           {% elif m == 'IDLE' %}Oczekiwanie
           {% elif m == 'OFFLINE' %}Ladowarka offline
           {% else %}Nieznany
@@ -166,6 +167,7 @@ template:
           {% elif m == 'EMERGENCY' %}mdi:lightning-bolt
           {% elif m == 'BATTERY_PRIORITY' %}mdi:battery-charging
           {% elif m == 'WINTER_NIGHT' %}mdi:weather-night
+          {% elif m == 'MANUAL' %}mdi:hand-back-right
           {% else %}mdi:car-electric
           {% endif %}
 

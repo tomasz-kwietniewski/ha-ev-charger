@@ -214,6 +214,31 @@ def test_surplus_battery_charging_uses_pcc():
     assert data["surplus_w"] == 3000, f"oczekiwano 3000 (PCC 2kW + bias), jest {data['surplus_w']}"
 
 
+def test_sofar_sensors_from_single_integration():
+    # 02.10.2026: solax_modbus i solarman na jednym loggerze dostawaly nawzajem
+    # swoje ramki, a solax lezal 21 h. Sterowanie czyta tylko solarmana.
+    for ent in (ev.SENSOR_SOC, ev.SENSOR_PV_POWER, ev.SENSOR_LOAD_POWER,
+                ev.SENSOR_GRID_POWER):
+        assert ent.startswith("sensor.sofar_logger_"), f"{ent} spoza solarmana"
+
+
+def test_power_in_watts_normalized_to_kw():
+    # Solarman podaje moc w W, logika liczy w kW. Ten sam stan co
+    # test_surplus_deficit_is_negative, tylko w watach z jednostka w atrybucie.
+    c = make_ctrl({
+        ev.SENSOR_SOC: "100", ev.SENSOR_PV_POWER: "1000",
+        ev.SENSOR_LOAD_POWER: "3000", ev.SENSOR_GRID_POWER: "-2000",
+        ev.SENSOR_PRICE: "1.0",
+        (ev.SENSOR_PV_POWER, "unit_of_measurement"): "W",
+        (ev.SENSOR_LOAD_POWER, "unit_of_measurement"): "W",
+        (ev.SENSOR_GRID_POWER, "unit_of_measurement"): "W",
+    })
+    data = c._get_ha_data(charger("SLEEP"))
+    assert data["surplus_w"] == -1000, f"oczekiwano -1000, jest {data['surplus_w']}"
+    assert data["grid_power"] == -2.0, f"PCC w kW, jest {data['grid_power']}"
+    assert data["pv_power"] == 1000, f"pv_power w W, jest {data['pv_power']}"
+
+
 def test_surplus_stable_across_session_start():
     # Kompensacja poboru ladowarki musi isc PRZED usrednianiem — inaczej
     # srednia miesza probki z rozna moca ladowania i prad skacze po starcie.

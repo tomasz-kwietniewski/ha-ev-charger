@@ -29,7 +29,7 @@ recorder:
       - sensor.sofar_logger_today_load_consumption
       - sensor.sofar_logger_today_energy_import
       - sensor.sofar_logger_today_energy_export
-      - sensor.sofar_modbus_battery_1_1_soc
+      - sensor.sofar_logger_battery
       - sensor.ev_energia_miesiac
       - sensor.ev_energia_lacznie
       - sensor.ev_historia_miesieczna

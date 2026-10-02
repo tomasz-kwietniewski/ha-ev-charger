@@ -253,10 +253,16 @@ EMERGENCY_HOURS_ENTITY = "input_number.ev_awaryjny_godziny"
 ARCHIVE_NOW_ENTITY = "input_button.ev_archiwizuj_teraz"
 
 # --- Sensory Sofar ---
-SENSOR_SOC        = "sensor.sofar_modbus_battery_1_1_soc"
-SENSOR_PV_POWER   = "sensor.sofar_modbus_inverter_pv_power_total"
-SENSOR_LOAD_POWER = "sensor.sofar_modbus_inverter_active_power_load_sys"
-SENSOR_GRID_POWER = "sensor.sofar_modbus_inverter_active_power_pcc_total"
+# Wszystkie z integracji Solarman (ha-solarman, profil sofar_g3hyd.yaml).
+# Do 10.2026 czytaliśmy SolaX Modbus, ale obie integracje łączyły się z tym
+# samym loggerem 192.168.50.15:8899 i dostawały nawzajem swoje odpowiedzi;
+# 1-2.10.2026 SolaX leżał przez to 21 h (SOC=0 -> skrypt nie ładował z PV).
+# Moc Solarman podaje w W - przeliczamy na kW w _get_ha_data po jednostce.
+# PCC: ten sam rejestr 0x0488 co w SolaX, ten sam znak (dodatni = eksport).
+SENSOR_SOC        = "sensor.sofar_logger_battery"
+SENSOR_PV_POWER   = "sensor.sofar_logger_pv_power"
+SENSOR_LOAD_POWER = "sensor.sofar_logger_activepower_load_sys"
+SENSOR_GRID_POWER = "sensor.sofar_logger_activepower_pcc_total"
 SENSOR_PRICE      = "sensor.pstryk_energy_pstryk_current_buy_price"
 
 # --- Archiwum historii miesięcznej ---
@@ -960,10 +966,16 @@ class EVChargerControl(hass.Hass):
             except (TypeError, ValueError):
                 return default
 
+        def power_kw(entity_id):
+            # Solarman: W, SolaX: kW. Jednostka z atrybutu, brak = kW.
+            val = safe_float(entity_id)
+            unit = self.get_state(entity_id, attribute="unit_of_measurement")
+            return val / 1000.0 if unit == "W" else val
+
         soc        = safe_float(SENSOR_SOC)
-        pv_power   = safe_float(SENSOR_PV_POWER)
-        load_power = safe_float(SENSOR_LOAD_POWER)
-        grid_power = safe_float(SENSOR_GRID_POWER)  # dodatni = eksport, ujemny = import
+        pv_power   = power_kw(SENSOR_PV_POWER)
+        load_power = power_kw(SENSOR_LOAD_POWER)
+        grid_power = power_kw(SENSOR_GRID_POWER)  # dodatni = eksport, ujemny = import
         price      = safe_float(SENSOR_PRICE, default=9.99)
 
         # Nadwyżka bez auta [kW] = min(eksport PCC, PV - dom).

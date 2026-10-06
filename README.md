@@ -232,10 +232,10 @@ ha-ev-charger/
 ## Sprzęt
 
 - **Ładowarka:** dé EV Charger 11 kW WiFi Typ 2 (~1150 zł)
-- **Falownik:** Sofar HYD 8KTL-3PH
+- **Falownik:** Sofar HYD 8 KTL-X G3
 - **Magazyn:** Sofar BTS E15-DS5 (15 kWh)
 - **Auto:** Citroën Spacetourer Electric 75 kWh
-- **HA:** Synology NAS DS420+
+- **HA:** Synology NAS DS920+
 
 ## Kluczowe pułapki techniczne
 

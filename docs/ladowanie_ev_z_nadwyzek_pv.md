@@ -637,6 +637,20 @@ Doszedł też watchdog, bo awaria trwała 21 godzin głównie dlatego, że nikt 
 
 **Wniosek:** błąd, który „leci zawsze, także gdy wszystko działa”, to nie szum, tylko objaw, który jeszcze nie trafił na swoją okazję. I druga lekcja: urządzenie, które przyjmuje kilka połączeń naraz, wcale nie musi umieć ich od siebie oddzielić.
 
+### Problem 29: Tryb zimowy, który dobrze wyglądał tylko na papierze
+
+Przed pierwszymi mrozami zrobiłem przegląd trybu zimowego. W kodzie było pięć linijek: przełącznik włączony i godzina między 22 a 6, więc ładuj na 10A. Symulacja nocy na kodzie produkcyjnym pokazała trzy rzeczy, które wyszłyby dopiero w styczniu, i to w najgorszym momencie.
+
+**Pełne auto budziło dom w nocy.** Gdy auto kończyło ładowanie, wallbox przechodził w pauzę. Skrypt widział, że chce ładować, a ładowarka stoi, więc co dwie minuty wysyłał START. Po czterech komendach bez efektu uznawał wallbox za zawieszony i wysyłał push na oba telefony: „ładowarka nie reaguje, nadwyżka PV idzie do sieci”. O pierwszej w nocy, kiedy żadnej nadwyżki nie ma. Wallbox nie odróżni pełnego auta od własnego zawieszenia, ale skrypt może. Jeśli auto w tym podłączeniu już pobierało prąd i samo przestało, a ponowiony START nic nie zmienia, to jest naładowane (albo działa limit ustawiony w aucie). Taki stan dostał osobny tryb `CAR_FULL`: bez komend i bez alarmu aż do odpięcia kabla, z jedną ponowną próbą co trzy godziny na wypadek pomyłki. Alarm zostaje tylko dla auta, które od podłączenia nie wzięło ani kilowatogodziny, i mówi wprost, że to może być pełna bateria, a nie awaria. Do tego treść alarmu zależy teraz od trybu, więc w nocy nie wspomina o PV.
+
+**Stałe 10A nie patrzyło na dom.** Zimą w nocy falownik ładuje magazyn z sieci w taniej strefie, a pompy ciepła przy mrozie biorą kilka kilowatów. Auto 6,9 kW plus magazyn plus pompy łatwo wychodzi ponad 11 kW przyłącza. Do tego pompy są jednofazowe, więc pierwsza pada pojedyncza faza, zanim suma przekroczy limit. Prąd w trybach ładujących z sieci (zimowy, awaryjny, ujemne ceny) jest teraz tylko pułapem. Skrypt odejmuje od 11 kW, z zapasem pół kilowata, to, co bierze dom bez auta, razem z ładowaniem magazynu. Osobno pilnuje 16A na najbardziej obciążonej fazie, z prądów, które mierzy falownik. W dół schodzi od razu, w górę dopiero po minucie potwierdzenia. Gdy na auto nie zostaje nawet 6A, ładowanie staje (tryb `GRID_LIMIT`) i wraca, kiedy w przyłączu zrobi się miejsce. Kolejność jest celowa: magazyn ma pierwszeństwo, bo jego popołudniowe doładowanie (13-15, 4 kW) to zapas na najdroższe zimowe wieczory, więc ogranicznik przycina auto, a nie magazyn.
+
+**Okno 22-6 to nie cała taryfa.** G12W jest tania także w dzień, 13-15 zimą i 15-17 latem, a w soboty, niedziele i święta przez całą dobę. Tryb zimowy liczy teraz te strefy, ze świętami ruchomymi liczonymi od Wielkanocy. Sezon wyznaczają daty z taryfy (zima od 1 października do 31 marca), a nie zmiana czasu.
+
+Po drodze sprawdziłem jeszcze jeden pomysł: zimą w nocy ładować auto jedną fazą, 2-3,7 kW, żeby zostawić pompom więcej miejsca. Producent deklaruje taki przełącznik w modelu urządzenia, ale test z podłączonym autem pokazał, że wallbox go ignoruje, także po restarcie. Ładuje zawsze trzema fazami. Przy okazji wyszło, że jedna faza nie byłaby wcale lepsza: 16A na jednej fazie obciąża ją bardziej niż 3 razy 6A, a pompy siedzą właśnie na pojedynczych fazach. Ten sam test potwierdził, że prądy faz z falownika zgadzają się z pomiarem wallboxa, więc ogranicznik ma na czym polegać. I jeszcze jedna obserwacja: po restarcie z aplikacji wallbox sam wznawia ładowanie, bez żadnej komendy. Skrypt go zatrzymuje, ale warto wiedzieć, że przez chwilę ładuje się wtedy z sieci.
+
+**Wniosek:** tryb, który przez całe lato nie miał okazji zadziałać, trzeba przejść symulacją, zanim przyjdzie jego sezon. Przy pięciu linijkach kodu łatwo uznać, że nie ma czego sprawdzać, a wszystkie trzy błędy siedziały właśnie w tym, czego te linijki nie widziały: w aucie, w domu i w taryfie.
+
 ---
 
 ## Helpery w Home Assistant
@@ -648,7 +662,7 @@ Wymagane helpery — tworzone przez UI (Settings → Helpers):
 | Text   | `input_text.ev_charger_status`     | Status ładowarki (WORKING/SLEEP/PAUSE...) |
 | Text   | `input_text.ev_charger_mode`       | Aktywny tryb (SOLAR/EMERGENCY...)          |
 | Text   | `input_text.ev_data`               | JSON z pełnymi danymi sesji               |
-| Toggle | `input_boolean.ev_tryb_zimowy`     | Tryb zimowy — nocne ładowanie 22–6      |
+| Toggle | `input_boolean.ev_tryb_zimowy`     | Tryb zimowy - ładowanie w tańszej strefie G12W |
 | Toggle | `input_boolean.ev_tryb_awaryjny`   | Tryb awaryjny — ładuj na maksa teraz     |
 | Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (0,5–8h)            |
 | Button | `input_button.ev_archiwizuj_teraz` | Ręczna archiwizacja bieżącego miesiąca (opcjonalny) |

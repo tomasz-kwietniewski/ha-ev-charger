@@ -1346,6 +1346,223 @@ def test_ogon_po_stopie_to_nie_nowa_sesja():
     assert c._current_session_kwh > 5.0, "to ciag dalszy, nie nowa sesja"
 
 
+# ── Tryb zimowy po audycie 2026-10-22 ────────────────────────────────────────
+
+def _iteracja(c, ch, hd):
+    """Jedna iteracja petli bez odczytow z sieci - jak _main_loop."""
+    mode, target = c._decide(hd, ch)
+    c._apply_decision(mode, target, ch)
+    c._update_diag(ch, mode)
+    c._update_health(ch, mode)
+    return mode, target
+
+
+def _zima(states=None):
+    s = {ev.WINTER_MODE_ENTITY: "on"}
+    s.update(states or {})
+    return make_ctrl(s)
+
+
+def _w_nocy(fn):
+    """Zegar modulu na czwartek 10.12.2026, 1:05 - srodek strefy nocnej."""
+    def wrapper():
+        stary = ev.datetime
+        ev.datetime = _o_godzinie(1, dzien="2026-12-10")
+        try:
+            fn()
+        finally:
+            ev.datetime = stary
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+def test_g12w_strefy_dni_robocze_weekendy_swieta():
+    import datetime as _dt
+    def t(s):
+        return ev.g12w_cheap(_dt.datetime.strptime(s, "%Y-%m-%d %H:%M"))
+    # Czwartek, sezon zimowy: 22-6 i 13-15
+    assert t("2026-12-10 22:00") and t("2026-12-10 05:59")
+    assert not t("2026-12-10 06:00") and not t("2026-12-10 21:59")
+    assert t("2026-12-10 13:00") and t("2026-12-10 14:59")
+    assert not t("2026-12-10 15:00") and not t("2026-12-10 12:59")
+    # Sezon letni: okno dzienne 15-17, nie 13-15
+    assert t("2027-05-12 15:30") and not t("2027-05-12 13:30")
+    # Sezon wyznacza data, nie zmiana czasu: 25.10 to jeszcze czas letni, ale zima taryfowa
+    assert t("2026-10-26 13:30"), "poniedzialek 26.10 - zima taryfowa"
+    # Weekend cala doba
+    assert t("2026-12-12 10:00") and t("2026-12-13 18:00")
+    # Swieta stale i ruchome (Wielkanoc 2027 = 28.03)
+    assert t("2026-11-11 10:00"), "11 listopada"
+    assert t("2026-12-24 10:00"), "Wigilia - dzien wolny od 2025"
+    assert t("2027-03-29 10:00"), "Poniedzialek Wielkanocny 2027"
+    assert t("2027-05-27 10:00"), "Boze Cialo 2027"
+    assert not t("2027-03-30 10:00"), "wtorek po Wielkanocy to zwykly dzien"
+
+
+def test_wielkanoc_znane_daty():
+    assert ev._easter(2026) == (4, 5)
+    assert ev._easter(2027) == (3, 28)
+    assert ev._easter(2028) == (4, 16)
+
+
+def test_tryb_zimowy_laduje_w_sobote_w_dzien():
+    stary = ev.datetime
+    ev.datetime = _o_godzinie(12, dzien="2026-12-12")
+    try:
+        mode, target = _zima()._decide(ha_data(soc=20.0), charger("PAUSE"))
+    finally:
+        ev.datetime = stary
+    assert (mode, target) == ("WINTER_NIGHT", ev.WINTER_MAX_CURRENT), f"{mode}/{target}"
+
+
+def test_tryb_zimowy_nie_laduje_w_drogiej_strefie():
+    stary = ev.datetime
+    ev.datetime = _o_godzinie(10, dzien="2026-12-10")
+    try:
+        mode, _ = _zima()._decide(ha_data(soc=20.0), charger("PAUSE"))
+    finally:
+        ev.datetime = stary
+    assert mode == "BATTERY_PRIORITY", mode
+
+
+def test_tryb_zimowy_okno_dzienne_13_15():
+    stary = ev.datetime
+    ev.datetime = _o_godzinie(13, dzien="2026-12-10")
+    try:
+        mode, _ = _zima()._decide(ha_data(soc=20.0), charger("PAUSE"))
+    finally:
+        ev.datetime = stary
+    assert mode == "WINTER_NIGHT", mode
+
+
+@_w_nocy
+def test_przylacze_dom_bierze_duzo_mniej_dla_auta():
+    # Dom z magazynem laduja sie z sieci 5 kW: (10,5 - 5) kW / 690 W = 7,97 A
+    mode, target = _zima()._decide(ha_data(surplus_w=-5000, soc=20.0), charger("PAUSE"))
+    assert (mode, target) == ("WINTER_NIGHT", 7), f"{mode}/{target}"
+
+
+@_w_nocy
+def test_przylacze_najbardziej_obciazona_faza():
+    # Moc lacznie miesci sie z zapasem, ale pompa na L1 bierze 9 A: 16-1-9 = 6 A
+    hd = ha_data(surplus_w=-2000, soc=20.0)
+    hd["house_phase_a"] = 9.0
+    mode, target = _zima()._decide(hd, charger("PAUSE"))
+    assert (mode, target) == ("WINTER_NIGHT", 6), f"{mode}/{target}"
+
+
+@_w_nocy
+def test_przylacze_pelne_najpierw_minimum_potem_stop_i_wznowienie():
+    c = _zima()
+    pelne = ha_data(surplus_w=-9500, soc=20.0)          # zostaje 1,4 A
+    assert c._decide(pelne, charger("WORKING", power_w=4100)) == ("WINTER_NIGHT", ev.MIN_CURRENT_A)
+    assert c._decide(pelne, charger("WORKING", power_w=4100)) == (ev.GRID_LIMIT_MODE, 0)
+    # 7,25 A to za malo na wznowienie (minimum + 1,5 A zapasu)
+    assert c._decide(ha_data(surplus_w=-5500, soc=20.0), charger("PAUSE"))[0] == ev.GRID_LIMIT_MODE
+    mode, target = c._decide(ha_data(surplus_w=-4000, soc=20.0), charger("PAUSE"))
+    assert (mode, target) == ("WINTER_NIGHT", 9), f"{mode}/{target}"
+
+
+@_w_nocy
+def test_przylacze_w_gore_z_potwierdzeniem_w_dol_od_razu():
+    c = _zima()
+    c._last_sent_current = 7
+    luz = ha_data(surplus_w=-3000, soc=20.0)             # 10,9 A -> pulap 10
+    assert c._decide(luz, charger("WORKING", power_w=4800))[1] == 7, "w gore nie od razu"
+    assert c._decide(luz, charger("WORKING", power_w=4800))[1] == 10
+    c._last_sent_current = 10
+    ciasno = ha_data(surplus_w=-4800, soc=20.0)          # 8,3 A
+    assert c._decide(ciasno, charger("WORKING", power_w=6900))[1] == 8, "w dol od razu"
+
+
+@_w_nocy
+def test_przylacze_bierze_gorsza_z_sredniej_i_biezacej_probki():
+    hd = ha_data(surplus_w=-1000, soc=20.0)
+    hd["available_now_kw"] = -5.0                        # wlasnie ruszyla pompa
+    assert _zima()._decide(hd, charger("PAUSE"))[1] == 7
+
+
+def test_przylacze_dotyczy_tez_trybu_awaryjnego():
+    import datetime as _dt
+    c = make_ctrl({ev.EMERGENCY_MODE_ENTITY: "on"})
+    c._emergency_end_time = _dt.datetime.now() + _dt.timedelta(hours=2)
+    mode, target = c._decide(ha_data(surplus_w=-6000, soc=80.0), charger("PAUSE"))
+    assert (mode, target) == ("EMERGENCY", 6), f"{mode}/{target}"
+
+
+@_w_nocy
+def test_pelne_auto_w_nocy_bez_alarmu_i_bez_spamu():
+    # AUDYT 2026-10-22: auto skonczylo ladowanie, wallbox w PAUSE, pomiar stoi.
+    # Wczesniej: START co 2 min i push "ladowarka nie reaguje" na oba telefony.
+    c = _zima()
+    c._last_sent_switch, c._last_sent_current = True, 10
+    for i in range(5):
+        _iteracja(c, charger("WORKING", power_w=6900, current_a=10,
+                             metrics_raw='{"p":%d}' % (690 + i)), ha_data(soc=20.0))
+    stoi = '{"L1":[2300,0,0],"t":300}'
+    for _ in range(240):                                  # 2 h po zakonczeniu
+        mode, _ = _iteracja(c, charger("PAUSE", metrics_raw=stoi), ha_data(soc=20.0))
+    assert mode == ev.CAR_FULL_MODE, mode
+    assert not _pushes(c), f"falszywy alarm: {_pushes(c)}"
+    starts = [x for x in c._device.switch_sends() if x[1] is True]
+    assert len(starts) <= 1, f"za duzo START: {starts}"
+
+
+@_w_nocy
+def test_pelne_auto_konczy_sie_po_odpieciu_kabla():
+    c = _zima()
+    c._car_drew_power, c._car_full = True, True
+    assert c._decide(ha_data(soc=20.0), charger("PAUSE"))[0] == ev.CAR_FULL_MODE
+    assert c._decide(ha_data(soc=20.0), charger("IDLE", cp_volts=11.7))[0] == "IDLE"
+    assert c._decide(ha_data(soc=20.0), charger("PAUSE"))[0] == "WINTER_NIGHT"
+
+
+@_w_nocy
+def test_pelne_auto_ponowna_proba_po_3h():
+    c = _zima()
+    c._car_drew_power, c._car_full = True, True
+    for _ in range(ev.CAR_FULL_RECHECK_ITERS - 1):
+        assert c._decide(ha_data(soc=20.0), charger("PAUSE"))[0] == ev.CAR_FULL_MODE
+    assert c._decide(ha_data(soc=20.0), charger("PAUSE"))[0] == "WINTER_NIGHT"
+
+
+@_w_nocy
+def test_tryb_awaryjny_kasuje_wniosek_o_pelnym_aucie():
+    c = _zima({ev.EMERGENCY_MODE_ENTITY: "on"})
+    c._car_full = True
+    c._on_emergency_toggle(ev.EMERGENCY_MODE_ENTITY, None, "off", "on", {})
+    assert c._decide(ha_data(soc=80.0), charger("PAUSE"))[0] == "EMERGENCY"
+
+
+@_w_nocy
+def test_working_bez_poboru_po_cyklach_budzenia_to_pelne_auto():
+    c = _zima()
+    c._last_sent_switch, c._last_sent_current = True, 10
+    c._car_drew_power = True
+    for i in range(200):                                  # 100 min WORKING+0W
+        mode, _ = _iteracja(c, charger("WORKING", power_w=0, current_a=10,
+                                       metrics_raw='{"t":%d}' % (300 + i % 5)),
+                            ha_data(soc=20.0))
+        if mode == ev.CAR_FULL_MODE:
+            break
+    assert mode == ev.CAR_FULL_MODE, mode
+    assert not _pushes(c), _pushes(c)
+
+
+@_w_nocy
+def test_auto_bez_poboru_od_podlaczenia_alarm_mowi_prawde():
+    # Auto podlaczone pelne (albo z limitem) - wallbox tego nie odrozni od
+    # zawieszenia, wiec alarm zostaje, ale bez bajki o nadwyzce PV.
+    c = _zima()
+    stoi = '{"L1":[2300,0,0],"t":300}'
+    for _ in range(40):
+        _iteracja(c, charger("PAUSE", metrics_raw=stoi), ha_data(soc=20.0))
+    p = _pushes(c)
+    assert p, "bez zadnego poboru w tym podlaczeniu alarm ma zostac"
+    assert "Nadwyżka PV" not in p[0]["message"], p[0]["message"]
+    assert "limit" in p[0]["message"], p[0]["message"]
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

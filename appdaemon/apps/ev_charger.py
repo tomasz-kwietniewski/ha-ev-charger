@@ -236,11 +236,54 @@ ACTIVE_CHARGING_MODES = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
 AUTOMATION_ENTITY = "input_boolean.ev_automatyka"
 MANUAL_MODE       = "MANUAL"
 
-# --- Tryb zimowy ---
+# --- Tryb zimowy: ładowanie z sieci w tanich strefach G12W (2026-10-22) ---
+# Do 10.2026 tryb zimowy znał tylko okno 22-6. Dystrybucja jest już w G12W
+# (PGE Dystrybucja), od 1.12.2026 także sprzedaż - a G12W ma tanią całą dobę
+# w soboty, niedziele i święta oraz drugie okno w dzień. Sezon taryfy wyznaczają
+# daty (lato 1.04-30.09, zima 1.10-31.03), nie zmiana czasu. Godziny lokalne.
 WINTER_MODE_ENTITY  = "input_boolean.ev_tryb_zimowy"
-WINTER_MAX_CURRENT  = 10
-WINTER_START_HOUR   = 22
-WINTER_END_HOUR     = 6
+WINTER_MAX_CURRENT  = 10      # [A] górny pułap; ogranicznik przyłącza może zejść niżej
+G12W_SUMMER_MONTHS  = range(4, 10)            # kwiecień-wrzesień
+G12W_CHEAP_WINTER   = ((22, 6), (13, 15))     # (od, do) - "do" wyłącznie
+G12W_CHEAP_SUMMER   = ((22, 6), (15, 17))
+# Święta ustawowo wolne (MM-DD). 24.12 jest dniem wolnym od 2025 r. - zakładam,
+# że taryfa PGE traktuje go jak inne święta (zapis "dni ustawowo wolne od pracy");
+# niesprawdzone w samej taryfie.
+G12W_FIXED_HOLIDAYS = ("01-01", "01-06", "05-01", "05-03", "08-15", "11-01",
+                       "11-11", "12-24", "12-25", "12-26")
+
+# --- Ochrona przyłącza przy ładowaniu z sieci (2026-10-22) ---
+# Powód: tryb zimowy dawał stałe 10 A (6,9 kW) bez patrzenia na dom. Zimą
+# w nocy falownik ładuje magazyn z sieci (ToU 22-6, 2,3 kW; 13-15, 4 kW),
+# a pompy ciepła przy mrozie biorą kilka kW - razem łatwo wyjść ponad 11 kW.
+# Pompy są jednofazowe, więc pilnujemy też najbardziej obciążonej fazy.
+GRID_LIMIT_W          = 11000   # [W] moc przyłączeniowa
+GRID_LIMIT_MARGIN_W   = 500     # [W] zapas na skoki między odczytami
+PHASE_LIMIT_A         = 16      # [A] 11 kW / 3 fazy
+PHASE_LIMIT_MARGIN_A  = 1       # [A]
+# Prąd w górę dopiero z zapasem i po potwierdzeniu - w dół od razu.
+GRID_UP_MARGIN_A      = 0.5
+# Gdy na auto nie zostaje nawet MIN_CURRENT_A: najpierw schodzimy do minimum,
+# STOP dopiero po tylu iteracjach (czajnik nie powinien klikać stycznikiem),
+# a wznowienie wymaga zapasu ponad minimum.
+GRID_STOP_CONFIRM_ITERS = 2
+GRID_RESUME_MARGIN_A  = 1.5
+GRID_LIMIT_MODE       = "GRID_LIMIT"
+# Prąd na fazie z miernika PCC falownika. Bez znaku - przy eksporcie na fazie
+# zawyża pobór domu, czyli myli się w bezpieczną stronę.
+SENSOR_PCC_CURRENTS = ("sensor.sofar_logger_current_pcc_r",
+                       "sensor.sofar_logger_current_pcc_s",
+                       "sensor.sofar_logger_current_pcc_t")
+
+# --- Auto naładowane (2026-10-22) ---
+# Powód: audyt trybu zimowego. Auto, które skończyło ładowanie w nocy, zostawia
+# wallbox w PAUSE. Skrypt wysyłał wtedy START co 2 minuty, po czterech liczył
+# "komendy bez efektu" i budził oba telefony pushem o awarii. Gdy auto już
+# w tym podłączeniu pobierało prąd i samo przestało, to nie jest awaria, tylko
+# pełna bateria (albo limit/harmonogram w aucie). Wtedy przestajemy prosić
+# o ładowanie do odpięcia kabla, z rzadką ponowną próbą na wypadek pomyłki.
+CAR_FULL_MODE          = "CAR_FULL"
+CAR_FULL_RECHECK_ITERS = 360    # 360 × 30 s = 3 h
 
 # --- Tryb EMERGENCY ---
 EMERGENCY_MODE_ENTITY  = "input_boolean.ev_tryb_awaryjny"
@@ -291,6 +334,46 @@ CHARGER_READY_STATES   = {"PAUSE", "SLEEP", "IDLE", "IDLEINS", "UNKNOWN"}
 CHARGER_WORKING_STATES = {"WORKING"}
 
 
+def _easter(year):
+    """Niedziela wielkanocna (algorytm Gaussa/Meeusa) jako (miesiąc, dzień)."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    return (h + l - 7 * m + 114) // 31, (h + l - 7 * m + 114) % 31 + 1
+
+
+def is_holiday(now):
+    """Święto ustawowo wolne. Ruchome liczone od Wielkanocy: niedziela,
+    poniedziałek (+1), Zielone Świątki (+49), Boże Ciało (+60).
+
+    Daty budujemy z `now` (replace), a nie z datetime.date - testy podmieniają
+    moduł datetime na atrapę z samym zegarem.
+    """
+    today = now.date()
+    if today.strftime("%m-%d") in G12W_FIXED_HOLIDAYS:
+        return True
+    em, ed = _easter(today.year)
+    easter = today.replace(month=em, day=ed)
+    return (today - easter).days in (0, 1, 49, 60)
+
+
+def g12w_cheap(now):
+    """Czy `now` (czas lokalny) wypada w tańszej strefie G12W."""
+    if now.weekday() >= 5 or is_holiday(now):
+        return True
+    windows = G12W_CHEAP_SUMMER if now.month in G12W_SUMMER_MONTHS else G12W_CHEAP_WINTER
+    h = now.hour
+    for start, end in windows:
+        if (start <= h < end) if start < end else (h >= start or h < end):
+            return True
+    return False
+
+
 class EVChargerControl(hass.Hass):
 
     def _init_runtime_state(self):
@@ -329,6 +412,14 @@ class EVChargerControl(hass.Hass):
         self._iters_schedule_empty  = 0
         self._emergency_end_time  = None
         self._surplus_history         = []
+        # --- Ochrona przyłącza (2026-10-22) ---
+        self._grid_limited          = False   # STOP z braku miejsca w przyłączu
+        self._grid_low_iters        = 0       # iteracje z zapasem poniżej minimum
+        self._grid_up_iters         = 0       # potwierdzenie podniesienia prądu
+        # --- Auto naładowane (2026-10-22) ---
+        self._car_drew_power        = False   # auto pobierało prąd w tym podłączeniu
+        self._car_full              = False
+        self._car_full_iters        = 0
         # --- DIAG bug 2: śledzenie czy wallbox tkwi w WORKING+0W i czy DP 151 się zmienia ---
         self._working_zero_power_streak = 0
         self._last_schedule_seen        = None
@@ -414,6 +505,8 @@ class EVChargerControl(hass.Hass):
         # zmieniał prąd i START/STOP w aplikacji. Bez wyzerowania dedup uznałby
         # po powrocie, że komendy już poszły, i czekał na cykl ponowień.
         self._forget_sent_commands()
+        self._car_full       = False
+        self._car_full_iters = 0
         # Od razu, nie za 30 s - przełącznik ma działać natychmiast: dashboard
         # pokazuje nowy tryb, a po włączeniu skrypt od razu obejmuje stery.
         self._main_loop({})
@@ -454,6 +547,9 @@ class EVChargerControl(hass.Hass):
             self._clear_schedule()
             self._last_sent_switch  = None
             self._last_sent_current = -1
+            # Człowiek mówi "ładuj" - wcześniejszy wniosek "auto pełne" nie wiąże.
+            self._car_full       = False
+            self._car_full_iters = 0
         else:
             self._emergency_end_time = None
             self.log("EMERGENCY STOP: powrót do trybu normalnego")
@@ -611,10 +707,12 @@ class EVChargerControl(hass.Hass):
                 self.log(f"Auto odlaczone od ladowarki (Control Pilot {cp}V)")
             self._last_car_connected = polaczone
 
-        if mode == MANUAL_MODE:
-            # Skrypt nie steruje, więc nie ma czego oceniać: stojący pomiar
+        if mode in (MANUAL_MODE, CAR_FULL_MODE):
+            # MANUAL: skrypt nie steruje, więc nie ma czego oceniać: stojący pomiar
             # przy ręcznej sesji to nie powód do restartu, a komend bez efektu
-            # nie ma, bo żadnych nie wysyłamy. Liczniki jak po długim postoju -
+            # nie ma, bo żadnych nie wysyłamy. CAR_FULL: auto nie chce prądu,
+            # więc stojący pomiar to postój, a okno tolerancji po próbach
+            # STARTu nie może z niego zrobić alarmu. Liczniki jak po długim postoju -
             # po powrocie automatyki diagnostyka startuje od zera, zamiast
             # alarmować w pierwszej iteracji. Ewentualne wcześniejsze
             # powiadomienie o awarii zostaje: nie wiemy, czy minęła.
@@ -690,10 +788,18 @@ class EVChargerControl(hass.Hass):
 
             if not self._health_notified:
                 self._health_notified = True
-                tekst = (
-                    "Ładowarka nie reaguje: " + opis + ". "
-                    "Nadwyżka PV idzie do sieci zamiast do auta. " + self._reboot_hint()
-                )
+                # Skutek zależy od trybu: w nocy nie ma żadnej nadwyżki PV.
+                skutek = ("Nadwyżka PV idzie do sieci zamiast do auta. "
+                          if mode == "SOLAR" else "Auto się nie ładuje. ")
+                # Auto, które w tym podłączeniu nie wzięło jeszcze prądu, mogło
+                # przyjechać pełne albo mieć własny limit - tego wallbox nie
+                # odróżni od zawieszenia, więc mówimy to wprost.
+                if (not self._car_drew_power
+                        and charger_data.get("car_connected") is True
+                        and charger_data["status"] not in CHARGER_WORKING_STATES):
+                    skutek += ("Jeśli auto jest naładowane albo ma limit lub "
+                               "harmonogram ładowania, to nie awaria. ")
+                tekst = "Ładowarka nie reaguje: " + opis + ". " + skutek + self._reboot_hint()
                 self.log(f"AWARIA WALLBOXA: {tekst} "
                          f"DP102_raw={raw!r}", level="ERROR")
                 self._notify_problem(tekst)
@@ -993,13 +1099,22 @@ class EVChargerControl(hass.Hass):
         # (średnia z próbek mierzonych przy różnej mocy ładowania + bieżąca moc)
         # daje przeszacowanie i skok prądu tuż po starcie sesji.
         available_kw = surplus_without_ev_kw
+        ev_power_w = 0.0
         if charger_data["status"] in CHARGER_WORKING_STATES:
             power_w = charger_data["power_w"]
             if (power_w == 0
                     and self._working_zero_power_streak >= FROZEN_DP_FALLBACK_ITERS
                     and self._last_nonzero_power_w > 0):
                 power_w = self._last_nonzero_power_w
+            ev_power_w = power_w
             available_kw += power_w / 1000.0
+
+        # Najbardziej obciążona faza bez auta [A] - dla ogranicznika przyłącza.
+        # Brak któregokolwiek odczytu = None, wtedy liczy się sama moc łączna.
+        phase_a = [safe_float(e, default=None) for e in SENSOR_PCC_CURRENTS]
+        house_phase_a = None
+        if all(a is not None for a in phase_a):
+            house_phase_a = max(phase_a) - ev_power_w / (PHASES * VOLTAGE)
 
         # Uśrednianie — wygładzamy migotanie ±0.x kW przez ostatnie 3 odczyty (90s)
         self._surplus_history.append(available_kw)
@@ -1018,6 +1133,10 @@ class EVChargerControl(hass.Hass):
             "load_power":       load_power * 1000,
             "grid_power":       grid_power,
             "avg_available_kw": avg_available_kw,
+            # Bieżąca próbka obok średniej: ogranicznik przyłącza bierze
+            # gorszą z dwóch, bo średnia z 90 s spóźnia się z nagłym poborem.
+            "available_now_kw": available_kw,
+            "house_phase_a":    house_phase_a,
             "surplus_w":        surplus_w,
             "price":            price,
         }
@@ -1027,6 +1146,8 @@ class EVChargerControl(hass.Hass):
     # ------------------------------------------------------------------
 
     def _decide(self, ha_data, charger_data):
+        self._track_car(charger_data)
+
         # 0. Automatyka wyłączona - steruje człowiek. Przed wszystkim innym,
         # także przed trybem awaryjnym i zimowym: wyłącznik znaczy "nic".
         if not self._automation_enabled():
@@ -1049,6 +1170,16 @@ class EVChargerControl(hass.Hass):
                 and charger_status not in CHARGER_WORKING_STATES):
             return ("IDLE", 0)
 
+        # Auto naładowane — nie prosimy o prąd, aż kabel wyjdzie. Co
+        # CAR_FULL_RECHECK_ITERS jedna ponowna próba, gdyby to była pomyłka.
+        if self._car_full:
+            self._car_full_iters += 1
+            if self._car_full_iters < CAR_FULL_RECHECK_ITERS:
+                return (CAR_FULL_MODE, 0)
+            self._car_full       = False
+            self._car_full_iters = 0
+            self.log("CAR_FULL: ponowna proba - czy auto przyjmie ladowanie")
+
         price   = ha_data["price"]
         soc     = ha_data["soc"]
         surplus = ha_data["surplus_w"]
@@ -1062,21 +1193,25 @@ class EVChargerControl(hass.Hass):
                 self.log(f"EMERGENCY: SOC={soc:.0f}% < {SOC_EMERGENCY_MIN}% — zatrzymuję")
                 return ("BATTERY_PRIORITY", 0)
             self.log(f"Tryb EMERGENCY: prad={EMERGENCY_CURRENT_A}A, pozostalo={remaining_min}min")
-            return ("EMERGENCY", EMERGENCY_CURRENT_A)
+            return self._limit_to_grid("EMERGENCY", EMERGENCY_CURRENT_A,
+                                       ha_data, charger_data)
 
         # 2. Ujemna cena energii
         if price < NEGATIVE_PRICE_THRESHOLD:
             self.log(f"Tryb NEGATIVE_PRICE: cena={price:.2f} zl/kWh")
-            return ("NEGATIVE_PRICE", NEGATIVE_PRICE_CURRENT_A)
+            return self._limit_to_grid("NEGATIVE_PRICE", NEGATIVE_PRICE_CURRENT_A,
+                                       ha_data, charger_data)
 
-        # 3. Tryb zimowy — nocne ładowanie z sieci
-        winter_mode = self.get_state(WINTER_MODE_ENTITY) == "on"
-        if winter_mode:
-            now_hour = datetime.datetime.now().hour
-            in_night_window = (now_hour >= WINTER_START_HOUR or now_hour < WINTER_END_HOUR)
-            if in_night_window:
-                self.log(f"Tryb WINTER_NIGHT: godzina={now_hour}, prad={WINTER_MAX_CURRENT}A")
-                return ("WINTER_NIGHT", WINTER_MAX_CURRENT)
+        # 3. Tryb zimowy — ładowanie z sieci w tańszej strefie G12W.
+        # Nazwa trybu WINTER_NIGHT zostaje (dashboard, historia), choć od
+        # 2026-10-22 obejmuje też okno dzienne, weekendy i święta.
+        if self.get_state(WINTER_MODE_ENTITY) == "on":
+            now = datetime.datetime.now()
+            if g12w_cheap(now):
+                self.log(f"Tryb WINTER_NIGHT: tania strefa G12W "
+                         f"({now.strftime('%a %H:%M')}), pulap={WINTER_MAX_CURRENT}A")
+                return self._limit_to_grid("WINTER_NIGHT", WINTER_MAX_CURRENT,
+                                           ha_data, charger_data)
 
         # 4. Ochrona baterii
         if soc < SOC_THRESHOLD:
@@ -1112,6 +1247,95 @@ class EVChargerControl(hass.Hass):
                 return ("SOLAR", target)
             else:
                 return ("IDLE", 0)
+
+    def _track_car(self, charger_data):
+        """Co auto robiło w bieżącym podłączeniu kabla (dla stanu CAR_FULL)."""
+        if charger_data.get("car_connected") is False:
+            if self._car_full:
+                self.log("Auto odpiete - koniec stanu CAR_FULL")
+            self._car_drew_power = False
+            self._car_full       = False
+            self._car_full_iters = 0
+            self._wake_attempts  = 0
+            return
+        if charger_data["power_w"] > 0:
+            self._car_drew_power = True
+            if self._car_full:
+                self.log("Auto znow pobiera prad - koniec stanu CAR_FULL")
+                self._car_full       = False
+                self._car_full_iters = 0
+
+    def _set_car_full(self, powod):
+        self._car_full       = True
+        self._car_full_iters = 0
+        self.log(f"Auto nie przyjmuje pradu ({powod}) - uznaje, ze jest naladowane "
+                 f"(albo dziala limit/harmonogram w aucie). Nie wysylam START do "
+                 f"odpiecia kabla; ponowna proba za "
+                 f"{CAR_FULL_RECHECK_ITERS * UPDATE_INTERVAL_S // 3600} h.")
+
+    def _grid_headroom_a(self, ha_data):
+        """Ile amperów na fazę zostaje dla auta w granicach przyłącza.
+
+        Pobór domu bez auta bierzemy z tej samej nadwyżki co tryb SOLAR
+        (ujemna = dom ciągnie z sieci; ładowanie magazynu z sieci też się w niej
+        mieści), z gorszej z dwóch: średniej i bieżącej próbki. Faza: najbardziej
+        obciążona, gdy falownik podaje prądy PCC.
+        """
+        available_kw = min(ha_data["avg_available_kw"],
+                           ha_data.get("available_now_kw", ha_data["avg_available_kw"]))
+        headroom = ((GRID_LIMIT_W - GRID_LIMIT_MARGIN_W + available_kw * 1000)
+                    / (PHASES * VOLTAGE))
+        house_phase_a = ha_data.get("house_phase_a")
+        if house_phase_a is not None:
+            headroom = min(headroom, PHASE_LIMIT_A - PHASE_LIMIT_MARGIN_A - house_phase_a)
+        return headroom
+
+    def _limit_to_grid(self, mode, cap_a, ha_data, charger_data):
+        """Prąd ładowania z sieci przycięty do tego, co zostawia dom.
+
+        W dół od razu (chroni zabezpieczenie), w górę z zapasem i po
+        potwierdzeniu (CURRENT_HOLD_ITERS), żeby szum poboru nie pikał
+        wallboxem. Poniżej minimum ładowarki: najpierw minimum, STOP dopiero
+        po GRID_STOP_CONFIRM_ITERS, wznowienie z zapasem GRID_RESUME_MARGIN_A.
+        """
+        headroom = self._grid_headroom_a(ha_data)
+
+        if self._grid_limited:
+            if headroom < MIN_CURRENT_A + GRID_RESUME_MARGIN_A:
+                return (GRID_LIMIT_MODE, 0)
+            self._grid_limited = False
+            self._grid_low_iters = 0
+            self.log(f"Przylacze: zapas {headroom:.1f}A - wznawiam ladowanie ({mode})")
+
+        if headroom < MIN_CURRENT_A:
+            self._grid_low_iters += 1
+            if self._grid_low_iters >= GRID_STOP_CONFIRM_ITERS:
+                self._grid_limited = True
+                self.log(f"Przylacze pelne: dla auta zostaje {headroom:.1f}A "
+                         f"< {MIN_CURRENT_A}A - wstrzymuje {mode}", level="WARNING")
+                return (GRID_LIMIT_MODE, 0)
+            return (mode, MIN_CURRENT_A)
+        self._grid_low_iters = 0
+
+        want = min(cap_a, int(headroom))
+        last = self._last_sent_current
+        charging = charger_data["status"] in CHARGER_WORKING_STATES
+        if not charging or last <= 0 or want <= last:
+            self._grid_up_iters = 0
+            if charging and 0 < want < last:
+                self.log(f"Przylacze: redukcja {last}A -> {want}A "
+                         f"(zapas {headroom:.1f}A)")
+            return (mode, want)
+
+        # W górę: tylko z zapasem ponad kolejny stopień i po potwierdzeniu.
+        if headroom < last + 1 + GRID_UP_MARGIN_A:
+            self._grid_up_iters = 0
+            return (mode, last)
+        self._grid_up_iters += 1
+        if self._grid_up_iters < CURRENT_HOLD_ITERS:
+            return (mode, last)
+        self._grid_up_iters = 0
+        return (mode, want)
 
     def _surplus_to_current(self, surplus_w, last_a=None):
         """Nadwyżka [W] -> prąd [A], opcjonalnie z histerezą wokół progu stopnia.
@@ -1219,6 +1443,14 @@ class EVChargerControl(hass.Hass):
                     self._switch_mismatch_iters += 1
                     if self._switch_mismatch_iters >= SWITCH_RETRY_ITERATIONS:
                         self._switch_mismatch_iters = 0
+                        # Auto ładowało się w tym podłączeniu i nie wraca nawet
+                        # po ponowionym START: pełne, a nie awaria. Bez tego
+                        # pełne auto w nocy kończyło się pushem o awarii.
+                        if (self._car_drew_power and self._start_retries >= 1
+                                and charger_data.get("car_connected") is True):
+                            self._set_car_full(
+                                f"po ladowaniu stoi w {charger_status} mimo START")
+                            return
                         # Liczymy niezależnie od tego, czy jeszcze ponawiamy —
                         # po wyczerpaniu limitu wallbox dalej nie reaguje i to
                         # jest właśnie sygnał, który ma dotrzeć do człowieka.
@@ -1248,7 +1480,8 @@ class EVChargerControl(hass.Hass):
                 self._stop_retries          = 0
                 self._unresponsive_cmds     = 0
 
-        elif mode in ("BATTERY_PRIORITY", "IDLE", "OFFLINE"):
+        elif mode in ("BATTERY_PRIORITY", "IDLE", "OFFLINE",
+                      GRID_LIMIT_MODE, CAR_FULL_MODE):
             if charger_working:
                 if self._last_sent_switch is not False:
                     if self._set_switch(False):
@@ -1333,6 +1566,10 @@ class EVChargerControl(hass.Hass):
         if self._working_zero_power_streak < WAKE_CYCLE_AFTER_ITERS:
             return False                     # auto negocjuje, to jeszcze norma
         if self._wake_attempts >= WAKE_CYCLE_MAX_ATTEMPTS:
+            # Dwa cykle budzenia i dalej zero: auto nie chce prądu. Bez tego
+            # skrypt trzymał tryb aktywny przy WORKING+0W do rana.
+            if charger_data.get("car_connected") is not False:
+                self._set_car_full("WORKING bez poboru mimo cykli budzenia")
             return False                     # limit wyczerpany, nie klikamy dalej
 
         self._wake_attempts += 1

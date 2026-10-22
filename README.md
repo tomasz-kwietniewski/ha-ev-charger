@@ -9,14 +9,18 @@ Skrypt AppDaemon steruje ładowarką EV (protokół Tuya 3.5) lokalnie przez sie
 | Tryb | Warunek | Działanie |
 |------|---------|-----------|
 | `MANUAL` | Automatyka wyłączona (`input_boolean.ev_automatyka` = off, suwak w nagłówku karty) | Skrypt nie wysyła do ładowarki **nic** - sterujesz ze Smart Life albo przyciskiem na wallboxie. Pomiary i liczniki energii dalej się aktualizują |
+| `CAR_FULL` | Auto pobierało prąd w tym podłączeniu i samo przestało, nie wraca nawet po START | Auto uznane za naładowane: bez komend START i bez alarmu do odpięcia kabla, ponowna próba co 3 h |
 | `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen - ale nie przy SOC magazynu poniżej 20% (`SOC_EMERGENCY_MIN`) |
 | `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na 13A (~9 kW, bufor ~2 kW na dom przy przyłączu 11 kW) |
-| `WINTER_NIGHT` | Tryb zimowy włączony, godz. 22–6 | Ładuj na 10A (tania taryfa nocna) |
+| `WINTER_NIGHT` | Tryb zimowy włączony i tańsza strefa G12W: dni robocze 22-6 i 13-15 (latem 15-17), soboty, niedziele i święta całą dobę | Ładuj do 10A z sieci |
+| `GRID_LIMIT` | Tryb z ładowaniem z sieci, ale dom zajmuje przyłącze tak, że na auto nie zostaje 6A | Ładowarka wstrzymana, wraca przy zapasie 7,5A |
 | `SOLAR` | SOC baterii ≥ 95% i nadwyżka ≥ 1,6 kW | Ładuj proporcjonalnie do nadwyżki (6–16A); nadwyżka = min(eksport PCC, PV − zużycie domu) + bias |
 | `BATTERY_PRIORITY` | SOC < 95% | Czekaj, priorytet ładowania baterii |
 | `IDLE` | Brak nadwyżek lub auto niepodłączone | Ładowarka wyłączona |
 
 Tryby sprawdzane są w kolejności od góry. Wyłącznik automatyki ma pierwszeństwo przed wszystkim, a spośród trybów automatycznych najwyższy priorytet ma EMERGENCY.
+
+**Ochrona przyłącza.** W trybach ładujących z sieci (`EMERGENCY`, `NEGATIVE_PRICE`, `WINTER_NIGHT`) prąd z tabeli jest tylko pułapem. Skrypt odejmuje od 11 kW (z zapasem 0,5 kW) to, co bierze dom bez auta, razem z ładowaniem magazynu z sieci, a na najbardziej obciążonej fazie (prądy PCC z falownika) pilnuje 16A z zapasem 1A. W dół schodzi od razu, w górę po minucie potwierdzenia. Gdy na auto nie zostaje minimum 6A, ładowanie staje (`GRID_LIMIT`).
 
 ### Sterowanie ręczne - wyłącznik automatyki
 
@@ -86,7 +90,7 @@ Utwórz przez UI (Settings → Helpers) — **nie przez YAML**:
 | Text | `input_text.ev_charger_status` | Status ładowarki |
 | Text | `input_text.ev_charger_mode` | Aktywny tryb |
 | Text | `input_text.ev_data` | JSON z danymi sesji |
-| Toggle | `input_boolean.ev_tryb_zimowy` | Tryb zimowy (nocne ładowanie 22–6) |
+| Toggle | `input_boolean.ev_tryb_zimowy` | Tryb zimowy (ładowanie z sieci w tańszej strefie G12W) |
 | Toggle | `input_boolean.ev_tryb_awaryjny` | Tryb awaryjny (ładuj na maksa teraz) |
 | Number | `input_number.ev_awaryjny_godziny` | Czas trybu awaryjnego (min: 0,5 / max: 8 / step: 0,5 / unit: h) |
 | Button | `input_button.ev_archiwizuj_teraz` | Ręczna archiwizacja bieżącego miesiąca (opcjonalny, do testów/podglądu) |
@@ -136,7 +140,7 @@ entities:
         state: "on"
     row:
       entity: input_boolean.ev_tryb_zimowy
-      name: ❄️ Tryb zimowy (ładowanie nocne 22-6)
+      name: ❄️ Tryb zimowy (tania strefa G12W)
 ```
 
 Panel sterowania (toggle trybu awaryjnego/zimowego, status, statystyki) złóż z sensorów opisowych (`sensor.ev_status_opis`, `sensor.ev_tryb_opis`, `sensor.ev_moc_ladowania` itd.) w dowolnej karcie Entities — repo nie narzuca gotowego layoutu.

@@ -27,25 +27,37 @@ triggers:
     below: 0.01
     id: pelne
 conditions:
-  # Zanik odczytu REST albo restart HA to nie zdarzenie (atrybuty znikają i wracają)
+  # pelne: zanik odczytu REST albo restart HA to nie zdarzenie (atrybuty znikają i wracają).
+  # oproznienie: liczy się tylko data nowsza niż ostatni wywóz w historii. Dzięki temu
+  # opróżnienie z czasu, gdy HA albo odbiornik nie działały, zapisze się po powrocie
+  # (odbiornik pamięta lstEmpty), a powrót tej samej daty nie zrobi duplikatu.
   - condition: template
     value_template: >-
-      {{ trigger.from_state.state not in ['unavailable', 'unknown']
-         and trigger.to_state.state not in ['unavailable', 'unknown']
-         and (trigger.id == 'pelne'
-              or (trigger.from_state.attributes.lstEmpty is string
-                  and trigger.to_state.attributes.lstEmpty is string)) }}
+      {%- set ok = trigger.to_state is not none
+                   and trigger.to_state.state not in ['unavailable', 'unknown'] -%}
+      {%- if trigger.id == 'pelne' -%}
+        {{ ok and trigger.from_state is not none
+              and trigger.from_state.state not in ['unavailable', 'unknown'] }}
+      {%- else -%}
+        {%- set nowy = as_timestamp(trigger.to_state.attributes.lstEmpty | default(none), none) if ok else none -%}
+        {%- set ost = state_attr('sensor.szambo_historia', 'ostatni_wywoz') -%}
+        {%- set ost_ts = as_timestamp(strptime(ost, '%d.%m.%Y', none), none) if ost else none -%}
+        {{ nowy is not none and (ost_ts is none or nowy >= ost_ts + 86400) }}
+      {%- endif -%}
 actions:
   - variables:
       linia: >-
         {%- set fmt = '%Y-%m-%d %H:%M' -%}
         {%- set nowy = trigger.to_state.attributes -%}
-        {%- set stary = trigger.from_state.attributes -%}
+        {%- set stary = trigger.from_state.attributes if trigger.from_state else {} -%}
         {%- if trigger.id == 'oproznienie' -%}
           {%- set t = as_timestamp(nowy.lstEmpty) -%}
-          {%- set t0 = as_timestamp(stary.lstEmpty) -%}
-          {%- set pct = stary.pct -%}
-          {%- set cm = stary.lvlToFull -%}
+          {#- Poprzedni wywóz z odbiornika, a gdy go nie ma (powrót z unavailable) - z historii -#}
+          {%- set ost = state_attr('sensor.szambo_historia', 'ostatni_wywoz') -%}
+          {%- set t0 = as_timestamp(stary.lstEmpty | default(none), none)
+                       or (as_timestamp(strptime(ost, '%d.%m.%Y', none), none) if ost else none) -%}
+          {%- set pct = stary.pct | default('') -%}
+          {%- set cm = stary.lvlToFull | default('') -%}
         {%- else -%}
           {%- set t = now().timestamp() -%}
           {%- set t0 = as_timestamp(nowy.lstEmpty, none) -%}

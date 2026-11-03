@@ -6,6 +6,8 @@
 # oproznienie: odbiornik zmienia atrybut lstEmpty, gdy wykryje opróżnienie;
 #   pct i cm w wierszu to ostatni odczyt PRZED opróżnieniem.
 # pelne: lvlToFull spada do 0 cm (ten sam próg co alarm szambo_alarm).
+# koszt_zl = input_number.szambo_cena_wybrania w chwili opróżnienia (zmiana ceny = zmiana helpera w UI).
+# Kolumny m3/firma/uwagi zostają puste - uzupełnia się je ręcznie, jeśli trzeba.
 #
 # Wdrożenie: POST /api/config/automation/config/szambo_historia (treść jako JSON).
 id: szambo_historia
@@ -51,7 +53,12 @@ actions:
           {%- set cm = nowy.lvlToFull -%}
         {%- endif -%}
         {%- set dni = ((t - t0) / 86400) | round(1) if t0 else '' -%}
-        {{ now().strftime(fmt) }};{{ trigger.id }};{{ t | timestamp_custom(fmt) }};{{ pct }};{{ cm | string | replace('.', ',') }};{{ t0 | timestamp_custom(fmt) if t0 else '' }};{{ dni | string | replace('.', ',') }}
+        {%- set koszt = states('input_number.szambo_cena_wybrania') | int(0) if trigger.id == 'oproznienie' else '' -%}
+        {{ now().strftime(fmt) }};{{ trigger.id }};{{ t | timestamp_custom(fmt) }};{{ pct }};{{ cm | string | replace('.', ',') }};{{ t0 | timestamp_custom(fmt) if t0 else '' }};{{ dni | string | replace('.', ',') }};{{ koszt or '' }};;;aquilo;
   - action: shell_command.szambo_zapis
     data:
       linia: "{{ linia }}"
+  # Karta historii na dashboardzie czyta podsumowanie z CSV (command_line, co godzinę)
+  - action: homeassistant.update_entity
+    target:
+      entity_id: sensor.szambo_historia

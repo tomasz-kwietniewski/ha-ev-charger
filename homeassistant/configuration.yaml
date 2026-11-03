@@ -12,9 +12,10 @@ scene: !include scenes.yaml
 # Konfiguracja http (use_x_forwarded_for, trusted_proxies) przeniesiona do UI:
 # Ustawienia > System > Sieć > HTTP server. YAML wycofany w HA 2026.8, przestaje działać w 2027.2.0.
 
-# Zachowaj historię ważnych sensorów przez 365 dni
+# Zachowaj historię ważnych sensorów przez 10 lat (Tomasz 03.11.2026: historia szamba latami).
+# Tanie, bo include ogranicza zapis do ok. 30 encji (kilka tys. wierszy na dobę).
 recorder:
-  purge_keep_days: 365
+  purge_keep_days: 3650
   include:
     entities:
       - sensor.zuzycie_domu_miesiac
@@ -66,6 +67,31 @@ sensor:
 # Trwała historia szamba (automatyzacja szambo_historia, plik /config/szambo_historia.csv)
 shell_command:
   szambo_zapis: "/bin/sh /config/szambo_zapis.sh '{{ linia }}'"
+
+# Podsumowanie historii szamba (wywozy, cykle, koszty) dla karty na dashboardzie
+command_line:
+  - sensor:
+      name: "Szambo historia"
+      unique_id: szambo_historia
+      command: "python3 /config/szambo_historia.py"
+      command_timeout: 30
+      scan_interval: 3600
+      unit_of_measurement: "wywozów"
+      value_template: "{{ value_json.liczba_wywozow }}"
+      json_attributes:
+        - ostatni_wywoz
+        - dni_od_wywozu
+        - sredni_cykl_dni
+        - najkrotszy_cykl_dni
+        - najdluzszy_cykl_dni
+        - m3_na_dobe
+        - cena_ostatnia_zl
+        - prognoza_koszt_rok_zl
+        - koszt_wywozow_razem_zl
+        - koszt_jednorazowy_razem_zl
+        - lata
+        - jednorazowe
+        - wywozy
 
 logger:
   default: warning

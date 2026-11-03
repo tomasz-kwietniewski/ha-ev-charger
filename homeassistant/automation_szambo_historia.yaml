@@ -5,6 +5,9 @@
 #
 # oproznienie: odbiornik zmienia atrybut lstEmpty, gdy wykryje opróżnienie;
 #   pct i cm w wierszu to ostatni odczyt PRZED opróżnieniem.
+# oproznienie_poziom: zapas, gdy odbiornik nie zmienia lstEmpty (03.11.2026 po wywozie
+#   lstEmpty stało na 12.10): skok z niemal pełnego (< 30 cm do pełna) na > 100 cm do pełna.
+#   Czas = lstRead odczytu po wywozie. W CSV zapisuje się jako zwykłe "oproznienie".
 # pelne: lvlToFull spada do 0 cm (ten sam próg co alarm szambo_alarm).
 # koszt_zl = input_number.szambo_cena_wybrania w chwili opróżnienia (zmiana ceny = zmiana helpera w UI).
 # Kolumny m3/firma/uwagi zostają puste - uzupełnia się je ręcznie, jeśli trzeba.
@@ -24,13 +27,20 @@ triggers:
   - trigger: numeric_state
     entity_id: sensor.szambo
     attribute: lvlToFull
+    above: 100
+    id: oproznienie_poziom
+  - trigger: numeric_state
+    entity_id: sensor.szambo
+    attribute: lvlToFull
     below: 0.01
     id: pelne
 conditions:
   # pelne: zanik odczytu REST albo restart HA to nie zdarzenie (atrybuty znikają i wracają).
-  # oproznienie: liczy się tylko data nowsza niż ostatni wywóz w historii. Dzięki temu
-  # opróżnienie z czasu, gdy HA albo odbiornik nie działały, zapisze się po powrocie
-  # (odbiornik pamięta lstEmpty), a powrót tej samej daty nie zrobi duplikatu.
+  # oproznienie: liczy się tylko data co najmniej 3 dni po ostatnim wywozie w historii
+  # (najkrótszy cykl to 15 dni). Dzięki temu opróżnienie z czasu, gdy HA albo odbiornik
+  # nie działały, zapisze się po powrocie (odbiornik pamięta lstEmpty), a późne
+  # potwierdzenie przez odbiornik wywozu zapisanego już po poziomie albo ręcznie
+  # nie zrobi duplikatu.
   - condition: template
     value_template: >-
       {%- set ok = trigger.to_state is not none
@@ -39,10 +49,17 @@ conditions:
         {{ ok and trigger.from_state is not none
               and trigger.from_state.state not in ['unavailable', 'unknown'] }}
       {%- else -%}
-        {%- set nowy = as_timestamp(trigger.to_state.attributes.lstEmpty | default(none), none) if ok else none -%}
+        {%- set a = trigger.to_state.attributes if ok else {} -%}
+        {%- if trigger.id == 'oproznienie_poziom' -%}
+          {%- set przed = trigger.from_state.attributes.lvlToFull | default(none) if trigger.from_state else none -%}
+          {%- set ok = ok and przed is number and przed < 30 -%}
+          {%- set nowy = as_timestamp(a.lstRead | default(none), none) if ok else none -%}
+        {%- else -%}
+          {%- set nowy = as_timestamp(a.lstEmpty | default(none), none) -%}
+        {%- endif -%}
         {%- set ost = state_attr('sensor.szambo_historia', 'ostatni_wywoz') -%}
         {%- set ost_ts = as_timestamp(strptime(ost, '%d.%m.%Y', none), none) if ost else none -%}
-        {{ nowy is not none and (ost_ts is none or nowy >= ost_ts + 86400) }}
+        {{ nowy is not none and (ost_ts is none or nowy >= ost_ts + 3 * 86400) }}
       {%- endif -%}
 actions:
   - variables:
@@ -50,11 +67,12 @@ actions:
         {%- set fmt = '%Y-%m-%d %H:%M' -%}
         {%- set nowy = trigger.to_state.attributes -%}
         {%- set stary = trigger.from_state.attributes if trigger.from_state else {} -%}
-        {%- if trigger.id == 'oproznienie' -%}
-          {%- set t = as_timestamp(nowy.lstEmpty) -%}
+        {%- set wywoz = trigger.id in ['oproznienie', 'oproznienie_poziom'] -%}
+        {%- if wywoz -%}
+          {%- set t = as_timestamp(nowy.lstEmpty if trigger.id == 'oproznienie' else nowy.lstRead) -%}
           {#- Poprzedni wywóz z odbiornika, a gdy go nie ma (powrót z unavailable) - z historii -#}
           {%- set ost = state_attr('sensor.szambo_historia', 'ostatni_wywoz') -%}
-          {%- set t0 = as_timestamp(stary.lstEmpty | default(none), none)
+          {%- set t0 = (as_timestamp(stary.lstEmpty | default(none), none) if trigger.id == 'oproznienie' else none)
                        or (as_timestamp(strptime(ost, '%d.%m.%Y', none), none) if ost else none) -%}
           {%- set pct = stary.pct | default('') -%}
           {%- set cm = stary.lvlToFull | default('') -%}
@@ -65,8 +83,8 @@ actions:
           {%- set cm = nowy.lvlToFull -%}
         {%- endif -%}
         {%- set dni = ((t - t0) / 86400) | round(1) if t0 else '' -%}
-        {%- set koszt = states('input_number.szambo_cena_wybrania') | int(0) if trigger.id == 'oproznienie' else '' -%}
-        {{ now().strftime(fmt) }};{{ trigger.id }};{{ t | timestamp_custom(fmt) }};{{ pct }};{{ cm | string | replace('.', ',') }};{{ t0 | timestamp_custom(fmt) if t0 else '' }};{{ dni | string | replace('.', ',') }};{{ koszt or '' }};;;aquilo;
+        {%- set koszt = states('input_number.szambo_cena_wybrania') | int(0) if wywoz else '' -%}
+        {{ now().strftime(fmt) }};{{ 'oproznienie' if wywoz else trigger.id }};{{ t | timestamp_custom(fmt) }};{{ pct }};{{ cm | string | replace('.', ',') }};{{ t0 | timestamp_custom(fmt) if t0 else '' }};{{ dni | string | replace('.', ',') }};{{ koszt or '' }};;;{{ 'aquilo-poziom' if trigger.id == 'oproznienie_poziom' else 'aquilo' }};
   - action: shell_command.szambo_zapis
     data:
       linia: "{{ linia }}"

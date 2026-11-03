@@ -1,0 +1,47 @@
+# Watchdog czujnika szamba - push, gdy czujnik albo odbiornik Aquilo milczy od 2 dób.
+# Bez tego alarm szambo_alarm (3 cm / pełne) po cichu przestaje działać, np. przy
+# wyczerpanej baterii czujnika, utracie zasięgu radiowego albo odbiorniku bez Wi-Fi.
+# 2 doby, nie 1 - Tomasz 03.11.2026: „mniej rygorystycznie”.
+#
+# Dwa przypadki:
+# - odbiornik odpowiada, ale czujnik w zbiorniku nie przysłał odczytu (lstRead stoi);
+# - odbiornik nie odpowiada wcale (sensor.szambo unavailable).
+#
+# Wdrożenie: POST /api/config/automation/config/szambo_watchdog (treść jako JSON).
+id: szambo_watchdog
+alias: "Szambo - czujnik nie odpowiada"
+description: >-
+  Push na vivo Tomka, gdy czujnik szamba nie przysłał odczytu od 48 godzin
+  albo odbiornik Aquilo nie odpowiada od 48 godzin.
+mode: single
+triggers:
+  - trigger: template
+    value_template: >-
+      {%- set t = as_timestamp(state_attr('sensor.szambo', 'lstRead'), none) -%}
+      {{ t is not none and now().timestamp() - t > 48 * 3600 }}
+    id: brak_odczytu
+  - trigger: state
+    entity_id: sensor.szambo
+    to: unavailable
+    for:
+      hours: 48
+    id: odbiornik
+actions:
+  - variables:
+      ostatni: >-
+        {%- set t = as_timestamp(state_attr('sensor.szambo', 'lstRead'), none) -%}
+        {{ t | timestamp_custom('%d.%m.%Y %H:%M') if t else 'brak danych' }}
+  - action: notify.mobile_app_tomek_vivo_x300_pro
+    data:
+      title: "Szambo: czujnik nie odpowiada"
+      message: >-
+        {% if trigger.id | default('') == 'odbiornik' %}Odbiornik Aquilo nie odpowiada od 2 dób (sprawdź zasilanie i Wi-Fi).
+        {% else %}Czujnik w zbiorniku nie przysłał odczytu od 2 dób (bateria albo zasięg).
+        {% endif %}Ostatni odczyt: {{ ostatni }}. Do tego czasu alarm „3 cm / pełne” nie zadziała.
+      data:
+        tag: szambo_watchdog
+        channel: Szambo
+        importance: high
+        priority: high
+        ttl: 0
+        notification_icon: mdi:access-point-off

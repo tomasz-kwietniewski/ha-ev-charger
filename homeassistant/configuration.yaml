@@ -43,7 +43,9 @@ recorder:
       - sensor.energia_sprzedana_miesiecznie
       # Szambo - historia do oceny tempa napełniania
       - sensor.pct
-      - sensor.szambo_dni_do_pelna
+      - sensor.lvl
+      - sensor.szambo_cm_do_pelna
+      - sensor.szambo   # atrybuty: lstEmpty, lstRead, bat
 
 sensor:
   - platform: rest
@@ -56,10 +58,14 @@ sensor:
       - pct
       - lstRead
       - bat
-      # Prognoza liczona przez odbiornik Aquilo (automatyzacja szambo_alarm)
+      # Liczone przez odbiornik Aquilo; lvlToFull używa automatyzacja szambo_alarm
       - daysLeft
       - lstEmpty
       - lvlToFull
+
+# Trwała historia szamba (automatyzacja szambo_historia, plik /config/szambo_historia.csv)
+shell_command:
+  szambo_zapis: "/bin/sh /config/szambo_zapis.sh '{{ linia }}'"
 
 logger:
   default: warning
@@ -93,13 +99,18 @@ template:
       - name: "Poziom"
         default_entity_id: sensor.lvl
         state: "{{ state_attr('sensor.szambo', 'lvl') | float(0) }}"
+        availability: "{{ state_attr('sensor.szambo', 'lvl') is number }}"
         unit_of_measurement: "cm"
         device_class: distance
+        # state_class = statystyki długoterminowe, których recorder nie kasuje po 365 dniach
+        state_class: measurement
 
       - name: "Procent"
         default_entity_id: sensor.pct
         state: "{{ state_attr('sensor.szambo', 'pct') | float(0) }}"
+        availability: "{{ state_attr('sensor.szambo', 'pct') is number }}"
         unit_of_measurement: "%"
+        state_class: measurement
 
       - name: "Bateria"
         default_entity_id: sensor.bat
@@ -131,6 +142,15 @@ template:
             unknown
           {% endif %}
 
+      - name: "Szambo cm do pełna"
+        default_entity_id: sensor.szambo_cm_do_pelna
+        unit_of_measurement: "cm"
+        device_class: distance
+        state_class: measurement
+        state: "{{ state_attr('sensor.szambo', 'lvlToFull') }}"
+        availability: "{{ state_attr('sensor.szambo', 'lvlToFull') is number }}"
+
+      # Prognoza odbiornika - tylko informacyjnie, alarm liczy centymetry
       - name: "Szambo dni do pełna"
         default_entity_id: sensor.szambo_dni_do_pelna
         unit_of_measurement: "d"

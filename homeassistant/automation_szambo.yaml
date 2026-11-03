@@ -1,6 +1,10 @@
 # Alarm szamba - push na telefon Tomka, niezależny od aplikacji Aquilo.
 # Dane: sensor.szambo (REST z odbiornika Aquilo w LAN, configuration.yaml).
-# Odbiornik sam liczy prognozę: daysLeft (dni do pełna), lstEmpty, lvlToFull.
+#
+# Liczymy centymetry, nie prognozę Aquilo (daysLeft): odbiornik wyznacza dzień
+# wybrania za wcześnie, a przy dużym zużyciu przybywa kilka cm na dobę, więc
+# 3 cm do pełna to sygnał "napisz dziś SMS, szambiarz przyjedzie jutro" (Tomasz 03.11.2026).
+# lvlToFull: cm do stanu pełnego, poniżej zera = ponad stan pełny.
 #
 # Wdrożenie: przez API konfiguracji automatyzacji (to samo, co zapis z UI):
 #   POST /api/config/automation/config/szambo_alarm  (treść tego pliku jako JSON)
@@ -8,19 +12,20 @@
 id: szambo_alarm
 alias: "Szambo - czas wezwać szambiarza"
 description: >-
-  Dzień wcześniej (prognoza Aquilo daysLeft <= 1) i przy 100% wysyła push
-  na vivo Tomka. Źródło: odbiornik Aquilo w LAN, bez chmury.
-mode: single
+  Gdy do pełna zostały 3 cm, push "zamów szambiarza na jutro"; gdy szambo pełne
+  (0 cm), push "wezwij dziś". Źródło: odbiornik Aquilo w LAN, bez chmury.
+# queued: przy skoku na 0 cm oba wyzwalacze przychodzą naraz, drugi bieg nie może przepaść
+mode: queued
 triggers:
   - trigger: numeric_state
     entity_id: sensor.szambo
-    attribute: daysLeft
-    below: 1.5
+    attribute: lvlToFull
+    below: 3.01
     id: prognoza
   - trigger: numeric_state
     entity_id: sensor.szambo
-    attribute: pct
-    above: 99
+    attribute: lvlToFull
+    below: 0.01
     id: pelne
 conditions:
   # Zanik odczytu REST albo restart HA: atrybut znika i wraca, a numeric_state
@@ -32,26 +37,26 @@ conditions:
 actions:
   - variables:
       pct: "{{ state_attr('sensor.szambo', 'pct') | int(0) }}"
-      dni: "{{ state_attr('sensor.szambo', 'daysLeft') }}"
+      cm: "{{ state_attr('sensor.szambo', 'lvlToFull') | float(0) }}"
       # Pełna data: samo "12.10" HA zamienia w zmiennej na liczbę 12.1
       oproznione: >-
         {% set t = as_timestamp(state_attr('sensor.szambo', 'lstEmpty'), none) %}
         {{ t | timestamp_custom('%d.%m.%Y') if t else 'brak danych' }}
   - choose:
-      # Prognoza tylko przy realnie zapełnionym zbiorniku - świeżo po opróżnieniu
-      # odbiornik nie ma jeszcze tempa napełniania i daysLeft bywa przypadkowe.
+      # Przy skoku z 4 cm od razu na 0 oba wyzwalacze odpalą się razem -
+      # wtedy wystarczy alarm "pełne".
       - conditions:
           - condition: trigger
             id: prognoza
           - condition: template
-            value_template: "{{ 70 <= pct < 100 }}"
+            value_template: "{{ cm > 0 }}"
         sequence:
           - action: notify.mobile_app_tomek_vivo_x300_pro
             data:
-              title: "Szambo: jutro będzie pełne"
+              title: "Szambo: do pełna {{ cm | round(0) | int }} cm"
               message: >-
-                Zapełnienie {{ pct }}%, prognoza Aquilo: {{ dni }} d do pełna.
-                Zamów szambiarza na jutro. Ostatnie opróżnienie: {{ oproznione }}.
+                Zapełnienie {{ pct }}%. Napisz dziś do szambiarza, żeby przyjechał jutro.
+                Ostatnie opróżnienie: {{ oproznione }}.
               data: &push
                 tag: szambo
                 channel: Szambo
@@ -67,6 +72,6 @@ actions:
             data:
               title: "Szambo pełne ({{ pct }}%)"
               message: >-
-                Czas wezwać szambiarza, najlepiej dziś.
+                {% if cm < 0 %}Już {{ (-cm) | round(0) | int }} cm ponad stan pełny. {% endif %}Czas wezwać szambiarza, najlepiej dziś.
                 Ostatnie opróżnienie: {{ oproznione }}.
               data: *push

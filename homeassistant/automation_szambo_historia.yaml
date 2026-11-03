@@ -1,0 +1,76 @@
+# Historia szamba - trwały zapis opróżnień i napełnień do /config/szambo_historia.csv
+# (shell_command.szambo_zapis -> szambo_zapis.sh). Tomasz liczy z tego koszty
+# i długość cyklu "od wybrania do wybrania"; aplikacja Aquilo bez abonamentu
+# pokazuje tylko ostatnie 2-3 miesiące.
+#
+# oproznienie: odbiornik zmienia atrybut lstEmpty, gdy wykryje opróżnienie;
+#   pct i cm w wierszu to ostatni odczyt PRZED opróżnieniem.
+# pelne: lvlToFull spada do 0 cm (ten sam próg co alarm szambo_alarm).
+# koszt_zl = input_number.szambo_cena_wybrania w chwili opróżnienia (zmiana ceny = zmiana helpera w UI).
+# Kolumny m3/firma/uwagi zostają puste - uzupełnia się je ręcznie, jeśli trzeba.
+#
+# Wdrożenie: POST /api/config/automation/config/szambo_historia (treść jako JSON).
+id: szambo_historia
+alias: "Szambo - zapis historii"
+description: >-
+  Dopisuje do /config/szambo_historia.csv każde opróżnienie (zmiana lstEmpty
+  w odbiorniku Aquilo) i każde napełnienie do pełna.
+mode: queued
+triggers:
+  - trigger: state
+    entity_id: sensor.szambo
+    attribute: lstEmpty
+    id: oproznienie
+  - trigger: numeric_state
+    entity_id: sensor.szambo
+    attribute: lvlToFull
+    below: 0.01
+    id: pelne
+conditions:
+  # pelne: zanik odczytu REST albo restart HA to nie zdarzenie (atrybuty znikają i wracają).
+  # oproznienie: liczy się tylko data nowsza niż ostatni wywóz w historii. Dzięki temu
+  # opróżnienie z czasu, gdy HA albo odbiornik nie działały, zapisze się po powrocie
+  # (odbiornik pamięta lstEmpty), a powrót tej samej daty nie zrobi duplikatu.
+  - condition: template
+    value_template: >-
+      {%- set ok = trigger.to_state is not none
+                   and trigger.to_state.state not in ['unavailable', 'unknown'] -%}
+      {%- if trigger.id == 'pelne' -%}
+        {{ ok and trigger.from_state is not none
+              and trigger.from_state.state not in ['unavailable', 'unknown'] }}
+      {%- else -%}
+        {%- set nowy = as_timestamp(trigger.to_state.attributes.lstEmpty | default(none), none) if ok else none -%}
+        {%- set ost = state_attr('sensor.szambo_historia', 'ostatni_wywoz') -%}
+        {%- set ost_ts = as_timestamp(strptime(ost, '%d.%m.%Y', none), none) if ost else none -%}
+        {{ nowy is not none and (ost_ts is none or nowy >= ost_ts + 86400) }}
+      {%- endif -%}
+actions:
+  - variables:
+      linia: >-
+        {%- set fmt = '%Y-%m-%d %H:%M' -%}
+        {%- set nowy = trigger.to_state.attributes -%}
+        {%- set stary = trigger.from_state.attributes if trigger.from_state else {} -%}
+        {%- if trigger.id == 'oproznienie' -%}
+          {%- set t = as_timestamp(nowy.lstEmpty) -%}
+          {#- Poprzedni wywóz z odbiornika, a gdy go nie ma (powrót z unavailable) - z historii -#}
+          {%- set ost = state_attr('sensor.szambo_historia', 'ostatni_wywoz') -%}
+          {%- set t0 = as_timestamp(stary.lstEmpty | default(none), none)
+                       or (as_timestamp(strptime(ost, '%d.%m.%Y', none), none) if ost else none) -%}
+          {%- set pct = stary.pct | default('') -%}
+          {%- set cm = stary.lvlToFull | default('') -%}
+        {%- else -%}
+          {%- set t = now().timestamp() -%}
+          {%- set t0 = as_timestamp(nowy.lstEmpty, none) -%}
+          {%- set pct = nowy.pct -%}
+          {%- set cm = nowy.lvlToFull -%}
+        {%- endif -%}
+        {%- set dni = ((t - t0) / 86400) | round(1) if t0 else '' -%}
+        {%- set koszt = states('input_number.szambo_cena_wybrania') | int(0) if trigger.id == 'oproznienie' else '' -%}
+        {{ now().strftime(fmt) }};{{ trigger.id }};{{ t | timestamp_custom(fmt) }};{{ pct }};{{ cm | string | replace('.', ',') }};{{ t0 | timestamp_custom(fmt) if t0 else '' }};{{ dni | string | replace('.', ',') }};{{ koszt or '' }};;;aquilo;
+  - action: shell_command.szambo_zapis
+    data:
+      linia: "{{ linia }}"
+  # Karta historii na dashboardzie czyta podsumowanie z CSV (command_line, co godzinę)
+  - action: homeassistant.update_entity
+    target:
+      entity_id: sensor.szambo_historia

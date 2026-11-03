@@ -9,14 +9,13 @@ automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
 
-http:
-  use_x_forwarded_for: true
-  trusted_proxies:
-    - 172.30.33.0/24
+# Konfiguracja http (use_x_forwarded_for, trusted_proxies) przeniesiona do UI:
+# Ustawienia > System > Sieć > HTTP server. YAML wycofany w HA 2026.8, przestaje działać w 2027.2.0.
 
-# Zachowaj historię ważnych sensorów przez 365 dni
+# Zachowaj historię ważnych sensorów przez 10 lat (Tomasz 03.11.2026: historia szamba latami).
+# Tanie, bo include ogranicza zapis do ok. 30 encji (kilka tys. wierszy na dobę).
 recorder:
-  purge_keep_days: 365
+  purge_keep_days: 3650
   include:
     entities:
       - sensor.zuzycie_domu_miesiac
@@ -43,6 +42,11 @@ recorder:
       - sensor.miesieczny_przychod_sprzedazy
       - sensor.energia_pobrana_miesiecznie
       - sensor.energia_sprzedana_miesiecznie
+      # Szambo - historia do oceny tempa napełniania
+      - sensor.pct
+      - sensor.lvl
+      - sensor.szambo_cm_do_pelna
+      - sensor.szambo   # atrybuty: lstEmpty, lstRead, bat
 
 sensor:
   - platform: rest
@@ -55,6 +59,39 @@ sensor:
       - pct
       - lstRead
       - bat
+      # Liczone przez odbiornik Aquilo; lvlToFull używa automatyzacja szambo_alarm
+      - daysLeft
+      - lstEmpty
+      - lvlToFull
+
+# Trwała historia szamba (automatyzacja szambo_historia, plik /config/szambo_historia.csv)
+shell_command:
+  szambo_zapis: "/bin/sh /config/szambo_zapis.sh '{{ linia }}'"
+
+# Podsumowanie historii szamba (wywozy, cykle, koszty) dla karty na dashboardzie
+command_line:
+  - sensor:
+      name: "Szambo historia"
+      unique_id: szambo_historia
+      command: "python3 /config/szambo_historia.py"
+      command_timeout: 30
+      scan_interval: 3600
+      unit_of_measurement: "wywozów"
+      value_template: "{{ value_json.liczba_wywozow }}"
+      json_attributes:
+        - ostatni_wywoz
+        - dni_od_wywozu
+        - sredni_cykl_dni
+        - najkrotszy_cykl_dni
+        - najdluzszy_cykl_dni
+        - m3_na_dobe
+        - cena_ostatnia_zl
+        - prognoza_koszt_rok_zl
+        - koszt_wywozow_razem_zl
+        - koszt_jednorazowy_razem_zl
+        - lata
+        - jednorazowe
+        - wywozy
 
 logger:
   default: warning
@@ -88,13 +125,18 @@ template:
       - name: "Poziom"
         default_entity_id: sensor.lvl
         state: "{{ state_attr('sensor.szambo', 'lvl') | float(0) }}"
+        availability: "{{ state_attr('sensor.szambo', 'lvl') is number }}"
         unit_of_measurement: "cm"
         device_class: distance
+        # state_class = statystyki długoterminowe, których recorder nie kasuje po 365 dniach
+        state_class: measurement
 
       - name: "Procent"
         default_entity_id: sensor.pct
         state: "{{ state_attr('sensor.szambo', 'pct') | float(0) }}"
+        availability: "{{ state_attr('sensor.szambo', 'pct') is number }}"
         unit_of_measurement: "%"
+        state_class: measurement
 
       - name: "Bateria"
         default_entity_id: sensor.bat
@@ -125,6 +167,27 @@ template:
           {% else %}
             unknown
           {% endif %}
+
+      - name: "Szambo cm do pełna"
+        default_entity_id: sensor.szambo_cm_do_pelna
+        unit_of_measurement: "cm"
+        device_class: distance
+        state_class: measurement
+        state: "{{ state_attr('sensor.szambo', 'lvlToFull') }}"
+        availability: "{{ state_attr('sensor.szambo', 'lvlToFull') is number }}"
+
+      # Prognoza odbiornika - tylko informacyjnie, alarm liczy centymetry
+      - name: "Szambo dni do pełna"
+        default_entity_id: sensor.szambo_dni_do_pelna
+        unit_of_measurement: "d"
+        state: "{{ state_attr('sensor.szambo', 'daysLeft') }}"
+        availability: "{{ state_attr('sensor.szambo', 'daysLeft') is number }}"
+
+      - name: "Szambo ostatnie opróżnienie"
+        default_entity_id: sensor.szambo_ostatnie_oproznienie
+        device_class: timestamp
+        state: "{{ state_attr('sensor.szambo', 'lstEmpty') }}"
+        availability: "{{ state_attr('sensor.szambo', 'lstEmpty') is string }}"
 
   - sensor:
       - name: "EV Status Opis"

@@ -148,7 +148,7 @@ template:
         default_entity_id: sensor.lstread
         state: >-
           {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
-          {% set t = as_timestamp(t_string) %}
+          {% set t = as_timestamp(t_string, none) %}
           {{ t | timestamp_custom('%d %b %H:%M') if t is number else '—' }}
 
       - name: "Ostatni odczyt"
@@ -161,7 +161,7 @@ template:
         unit_of_measurement: "min"
         state: >-
           {% set t_string = state_attr('sensor.szambo', 'lstRead') %}
-          {% set t = as_timestamp(t_string) %}
+          {% set t = as_timestamp(t_string, none) %}
           {% if t is number %}
             {{ ((now().timestamp() - t) / 60) | round(0) }}
           {% else %}

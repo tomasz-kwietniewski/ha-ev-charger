@@ -1,0 +1,72 @@
+# Alarm szamba - push na telefon Tomka, niezależny od aplikacji Aquilo.
+# Dane: sensor.szambo (REST z odbiornika Aquilo w LAN, configuration.yaml).
+# Odbiornik sam liczy prognozę: daysLeft (dni do pełna), lstEmpty, lvlToFull.
+#
+# Wdrożenie: przez API konfiguracji automatyzacji (to samo, co zapis z UI):
+#   POST /api/config/automation/config/szambo_alarm  (treść tego pliku jako JSON)
+# Automatyzacja trafia wtedy do /config/automations.yaml i od razu jest przeładowana.
+id: szambo_alarm
+alias: "Szambo - czas wezwać szambiarza"
+description: >-
+  Dzień wcześniej (prognoza Aquilo daysLeft <= 1) i przy 100% wysyła push
+  na vivo Tomka. Źródło: odbiornik Aquilo w LAN, bez chmury.
+mode: single
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.szambo
+    attribute: daysLeft
+    below: 1.5
+    id: prognoza
+  - trigger: numeric_state
+    entity_id: sensor.szambo
+    attribute: pct
+    above: 99
+    id: pelne
+conditions:
+  # Zanik odczytu REST albo restart HA: atrybut znika i wraca, a numeric_state
+  # wyzwala się ponownie. Takie powroty pomijamy (ręczny trigger nie ma from_state).
+  - condition: template
+    value_template: >-
+      {{ trigger.from_state is not defined
+         or trigger.from_state.state not in ['unavailable', 'unknown'] }}
+actions:
+  - variables:
+      pct: "{{ state_attr('sensor.szambo', 'pct') | int(0) }}"
+      dni: "{{ state_attr('sensor.szambo', 'daysLeft') }}"
+      # Pełna data: samo "12.10" HA zamienia w zmiennej na liczbę 12.1
+      oproznione: >-
+        {% set t = as_timestamp(state_attr('sensor.szambo', 'lstEmpty'), none) %}
+        {{ t | timestamp_custom('%d.%m.%Y') if t else 'brak danych' }}
+  - choose:
+      # Prognoza tylko przy realnie zapełnionym zbiorniku - świeżo po opróżnieniu
+      # odbiornik nie ma jeszcze tempa napełniania i daysLeft bywa przypadkowe.
+      - conditions:
+          - condition: trigger
+            id: prognoza
+          - condition: template
+            value_template: "{{ 70 <= pct < 100 }}"
+        sequence:
+          - action: notify.mobile_app_tomek_vivo_x300_pro
+            data:
+              title: "Szambo: jutro będzie pełne"
+              message: >-
+                Zapełnienie {{ pct }}%, prognoza Aquilo: {{ dni }} d do pełna.
+                Zamów szambiarza na jutro. Ostatnie opróżnienie: {{ oproznione }}.
+              data: &push
+                tag: szambo
+                channel: Szambo
+                importance: high
+                priority: high
+                ttl: 0
+                notification_icon: mdi:toilet
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.id | default('') != 'prognoza' }}"
+        sequence:
+          - action: notify.mobile_app_tomek_vivo_x300_pro
+            data:
+              title: "Szambo pełne ({{ pct }}%)"
+              message: >-
+                Czas wezwać szambiarza, najlepiej dziś.
+                Ostatnie opróżnienie: {{ oproznione }}.
+              data: *push

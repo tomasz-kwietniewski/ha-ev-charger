@@ -9,10 +9,8 @@ automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
 
-http:
-  use_x_forwarded_for: true
-  trusted_proxies:
-    - 172.30.33.0/24
+# Konfiguracja http (use_x_forwarded_for, trusted_proxies) przeniesiona do UI:
+# Ustawienia > System > Sieć > HTTP server. YAML wycofany w HA 2026.8, przestaje działać w 2027.2.0.
 
 # Zachowaj historię ważnych sensorów przez 365 dni
 recorder:
@@ -43,6 +41,9 @@ recorder:
       - sensor.miesieczny_przychod_sprzedazy
       - sensor.energia_pobrana_miesiecznie
       - sensor.energia_sprzedana_miesiecznie
+      # Szambo - historia do oceny tempa napełniania
+      - sensor.pct
+      - sensor.szambo_dni_do_pelna
 
 sensor:
   - platform: rest
@@ -55,6 +56,10 @@ sensor:
       - pct
       - lstRead
       - bat
+      # Prognoza liczona przez odbiornik Aquilo (automatyzacja szambo_alarm)
+      - daysLeft
+      - lstEmpty
+      - lvlToFull
 
 logger:
   default: warning
@@ -125,6 +130,18 @@ template:
           {% else %}
             unknown
           {% endif %}
+
+      - name: "Szambo dni do pełna"
+        default_entity_id: sensor.szambo_dni_do_pelna
+        unit_of_measurement: "d"
+        state: "{{ state_attr('sensor.szambo', 'daysLeft') }}"
+        availability: "{{ state_attr('sensor.szambo', 'daysLeft') is number }}"
+
+      - name: "Szambo ostatnie opróżnienie"
+        default_entity_id: sensor.szambo_ostatnie_oproznienie
+        device_class: timestamp
+        state: "{{ state_attr('sensor.szambo', 'lstEmpty') }}"
+        availability: "{{ state_attr('sensor.szambo', 'lstEmpty') is string }}"
 
   - sensor:
       - name: "EV Status Opis"

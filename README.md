@@ -9,7 +9,7 @@ Skrypt AppDaemon steruje ładowarką EV (protokół Tuya 3.5) lokalnie przez sie
 | Tryb | Warunek | Działanie |
 |------|---------|-----------|
 | `MANUAL` | Automatyka wyłączona (`input_boolean.ev_automatyka` = off, suwak w nagłówku karty) | Skrypt nie wysyła do ładowarki **nic** - sterujesz ze Smart Life albo przyciskiem na wallboxie. Pomiary i liczniki energii dalej się aktualizują |
-| `CAR_FULL` | Auto pobierało prąd w tym podłączeniu i samo przestało, nie wraca nawet po START | Auto uznane za naładowane: bez komend START i bez alarmu do odpięcia kabla, ponowna próba co 3 h |
+| `CAR_FULL` | Auto pobierało prąd w tym podłączeniu i samo przestało, nie wraca nawet po START | Auto uznane za naładowane: bez komend START i bez alarmu do odpięcia kabla, jedna ponowna próba po 3 h |
 | `EMERGENCY` | Włączony ręcznie przez toggle w HA | Ładuj natychmiast na 13A (~9 kW), niezależnie od PV i cen - ale nie przy SOC magazynu poniżej 20% (`SOC_EMERGENCY_MIN`) |
 | `NEGATIVE_PRICE` | Cena Pstryk < 0 zł/kWh | Ładuj na 13A (~9 kW, bufor ~2 kW na dom przy przyłączu 11 kW) |
 | `WINTER_NIGHT` | Tryb zimowy włączony i tańsza strefa G12W: dni robocze 22-6 i 13-15 (latem 15-17), soboty, niedziele i święta całą dobę | Ładuj do 10A z sieci |
@@ -20,7 +20,7 @@ Skrypt AppDaemon steruje ładowarką EV (protokół Tuya 3.5) lokalnie przez sie
 
 Tryby sprawdzane są w kolejności od góry. Wyłącznik automatyki ma pierwszeństwo przed wszystkim, a spośród trybów automatycznych najwyższy priorytet ma EMERGENCY.
 
-**Ochrona przyłącza.** W trybach ładujących z sieci (`EMERGENCY`, `NEGATIVE_PRICE`, `WINTER_NIGHT`) prąd z tabeli jest tylko pułapem. Skrypt odejmuje od 11 kW (z zapasem 0,5 kW) to, co bierze dom bez auta, razem z ładowaniem magazynu z sieci, a na najbardziej obciążonej fazie (prądy PCC z falownika) pilnuje 16A z zapasem 1A. W dół schodzi od razu, w górę po minucie potwierdzenia. Gdy na auto nie zostaje minimum 6A, ładowanie staje (`GRID_LIMIT`).
+**Ochrona przyłącza.** W trybach ładujących z sieci (`EMERGENCY`, `NEGATIVE_PRICE`, `WINTER_NIGHT`) prąd z tabeli jest tylko pułapem. Skrypt odejmuje od 11 kW (z zapasem 0,5 kW) to, co bierze dom bez auta, razem z ładowaniem magazynu z sieci, a na najbardziej obciążonej fazie (prądy PCC z falownika) pilnuje 16A z zapasem 1A. W dół schodzi od razu, w górę po minucie potwierdzenia. Gdy na auto nie zostaje minimum 6A, ładowanie staje (`GRID_LIMIT`). Przez 4 minuty po START, także gdy wallbox zacznie ładować sam po włożeniu kabla, prąd wynika z zapasu sprzed startu, bo wallbox zgłasza moc z opóźnieniem; realne przekroczenie limitu dalej schodzi do minimum od razu.
 
 ### Sterowanie ręczne - wyłącznik automatyki
 
@@ -274,6 +274,8 @@ ha-ev-charger/
 - **DP 102 ma ukryte pole `e` = energia sesji × 0,1 kWh** — niezależny od naszego liczenia `power × dt`, można użyć jako kontrolny licznik energii sesji
 - **DP 105 = historia ostatniej sesji** — JSON z `t` (timestamp), `s/e` (start/end), `d` (duration), `c` (kWh × 10); aktualizowany przez wallbox po zakończeniu sesji
 - **DP 151 a chmura Tuya** — wallbox po reboocie potrafi pobrać z chmury Tuya niezerowy harmonogram (`m:0` znaczy nieaktywny); skrypt czyści przy starcie sesji, dla bezpieczeństwa też przy każdym `initialize()` AppDaemona
+- **Moc w DP 102 spóźnia się po START** - wallbox zgłasza 0 W jeszcze 60-90 s, a auto już pobiera prąd. Licznik sieci widzi auto od razu, więc regulator liczący dom z sieci bierze je za dom i sam się zatrzymuje (72 cykle START/STOP na noc, listopad 2026). Stąd rampa `START_SETTLE_ITERS`
+- **`PAUSE` nie zawsze znaczy, że stoi** - po START status potrafi zostać `PAUSE`, a auto ładuje się dalej (bilans energii z nocy 4/5.11.2026). Dlatego w `PAUSE` ostatni START jest cofany jednym STOP, a moc w DP 102 razem ze stanem C na Control Pilot (5,6 V) przez 2 minuty liczy się jak `WORKING`
 - **Helpery tylko przez UI** — encje zdefiniowane w YAML są read-only dla serwisów HA
 - **Serwery Tuya dla Polski** — region "Central Europe", serwer Frankfurt AWS (nie Chiny)
 

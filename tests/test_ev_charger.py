@@ -1563,6 +1563,258 @@ def test_auto_bez_poboru_od_podlaczenia_alarm_mowi_prawde():
     assert "limit" in p[0]["message"], p[0]["message"]
 
 
+# --- Start ladowania: auto nie moze wygladac jak dom (2026-11-06) ---
+# Noce 4/5 i 5/6.11.2026: po START wallbox zgłasza 0 W jeszcze 60-90 s, a auto
+# juz ciagnie prad. Liczby z logu: zapas 9,7 A przed startem, 5,4 A po starcie.
+
+def _symuluj_start(c, iteracje=20, dom_kw=3.8, faza_a=5.3, auto_kw=3.3):
+    """Noc z logu: auto rusza po 1 iteracji, moc w DP 102 pojawia sie po 4."""
+    tryby = []
+    start_it = None
+    for i in range(iteracje):
+        wyslano = any(x[1] is True for x in c._device.switch_sends())
+        if wyslano and start_it is None:
+            start_it = i
+        wiek = None if start_it is None else i - start_it
+        realnie = auto_kw if (wiek is not None and wiek >= 1) else 0.0
+        zglaszane = auto_kw if (wiek is not None and wiek >= 4) else 0.0
+        hd = ha_data(surplus_w=(zglaszane - dom_kw - realnie) * 1000, soc=20.0)
+        hd["available_now_kw"] = hd["avg_available_kw"]
+        hd["grid_power"] = -(dom_kw + realnie)
+        hd["phase_now_a"] = faza_a + realnie * 1000 / 690
+        hd["house_phase_a"] = hd["phase_now_a"] - zglaszane * 1000 / 690
+        status = "WORKING" if wyslano else "PAUSE"
+        tryby.append(_iteracja(c, charger(status, power_w=zglaszane * 1000,
+                                          current_a=c._last_sent_current,
+                                          cp_volts=CP_LADUJE if wyslano else CP_PODLACZONE),
+                               hd))
+    return tryby
+
+
+@_w_nocy
+def test_start_nie_zatrzymuje_sie_przez_wlasne_auto():
+    c = _zima()
+    tryby = _symuluj_start(c)
+    stopy = [x for x in c._device.switch_sends() if x[1] is False]
+    starty = [x for x in c._device.switch_sends() if x[1] is True]
+    assert not stopy, f"STOP przez wlasne auto: {tryby}"
+    assert len(starty) == 1, f"petla START: {starty}"
+
+
+@_w_nocy
+def test_start_nie_szarpie_pradem_w_czasie_rampy():
+    c = _zima()
+    _symuluj_start(c, iteracje=ev.START_SETTLE_ITERS)
+    prady = _current_sends(c)
+    assert len(prady) == 1, f"pik przy kazdej zmianie pradu: {prady}"
+
+
+@_w_nocy
+def test_start_prawdziwy_wzrost_poboru_schodzi_do_minimum():
+    # Rampa nie wylacza ochrony: siec realnie ponad limitem = minimum od razu.
+    c = _zima()
+    c._last_sent_switch, c._last_sent_current = None, -1
+    _iteracja(c, charger("PAUSE"), ha_data(surplus_w=-3000, soc=20.0))
+    hd = ha_data(surplus_w=-11000, soc=20.0)
+    hd["grid_power"] = -11.0
+    mode, target = _iteracja(c, charger("WORKING", current_a=10), hd)
+    assert (mode, target) == ("WINTER_NIGHT", ev.MIN_CURRENT_A), f"{mode}/{target}"
+
+
+@_w_nocy
+def test_start_przeciazona_faza_schodzi_do_minimum():
+    c = _zima()
+    _iteracja(c, charger("PAUSE"), ha_data(surplus_w=-3000, soc=20.0))
+    hd = ha_data(surplus_w=-3000, soc=20.0)
+    hd["phase_now_a"] = 15.5
+    assert _iteracja(c, charger("WORKING", current_a=10), hd)[1] == ev.MIN_CURRENT_A
+
+
+@_w_nocy
+def test_po_rampie_ogranicznik_dziala_normalnie():
+    c = _zima()
+    _symuluj_start(c, iteracje=ev.START_SETTLE_ITERS + 2)
+    pelne = ha_data(surplus_w=-9500, soc=20.0)
+    assert c._decide(pelne, charger("WORKING", power_w=3300))[1] == ev.MIN_CURRENT_A
+    assert c._decide(pelne, charger("WORKING", power_w=3300))[0] == ev.GRID_LIMIT_MODE
+
+
+@_w_nocy
+def test_rampa_nie_przechodzi_ze_startu_solarnego():
+    # Stary START w trybie SOLAR nie moze zamrozic ogranicznika w nocy.
+    c = _zima()
+    assert c._grid_settle_left == 0
+    c._send_start()
+    assert c._grid_settle_left == 0, "bez zapasu z ogranicznika nie ma rampy"
+
+
+# --- START bez cofniecia i ladowanie przy PAUSE (noc 4/5.11.2026) ---
+
+@_w_nocy
+def test_grid_limit_po_starcie_przy_pause_wysyla_stop():
+    # 23:53:38 START, status zostal PAUSE, skrypt nie wyslal STOP i auto
+    # ladowalo sie do 7:46, rano z magazynu.
+    c = _zima()
+    c._last_sent_switch, c._last_sent_current = True, 6
+    pelne = ha_data(surplus_w=-9500, soc=20.0)
+    for _ in range(ev.GRID_STOP_CONFIRM_ITERS + 1):
+        mode, _t = _iteracja(c, charger("PAUSE", cp_volts=CP_LADUJE), pelne)
+    assert mode == ev.GRID_LIMIT_MODE, mode
+    stopy = [x for x in c._device.switch_sends() if x[1] is False]
+    assert len(stopy) == 1, f"START trzeba cofnac raz: {c._device.switch_sends()}"
+
+
+def test_stop_nie_jest_wysylany_gdy_nie_bylo_startu():
+    c = make_ctrl()
+    c._last_sent_switch = None
+    c._apply_decision("IDLE", 0, charger("PAUSE"))
+    c._apply_decision("IDLE", 0, charger("PAUSE"))
+    assert not c._device.switch_sends(), c._device.switch_sends()
+
+
+def test_stop_po_starcie_nie_idzie_do_pustego_gniazda():
+    c = make_ctrl()
+    c._last_sent_switch = True
+    c._apply_decision("IDLE", 0, charger("PAUSE", cp_volts=CP_ODPIETE))
+    assert not c._device.switch_sends(), c._device.switch_sends()
+
+
+def _odczyt(c, status, cp, amps, watts):
+    dp = {str(ev.DP_STATUS): status.lower(), str(ev.DP_CURRENT): 10,
+          str(ev.DP_METRICS): live_raw(amps=amps, watts=watts),
+          str(ev.DP_CHARGER_INFO): json.dumps({"cp": cp})}
+    c._device.status_response = {"dps": dp}
+    return c._get_charger_data()
+
+
+def test_ladowanie_przy_pause_wykryte_po_potwierdzeniu():
+    c = make_ctrl()
+    for _ in range(ev.HIDDEN_CHARGE_ITERS - 1):
+        d = _odczyt(c, "PAUSE", CP_LADUJE, 90, 21)
+        assert d["status"] == "PAUSE", "pojedynczy odczyt to moze byc ogon po STOP"
+        assert d["power_w"] == 0
+    d = _odczyt(c, "PAUSE", CP_LADUJE, 90, 21)
+    assert d["status"] == "WORKING", d["status"]
+    assert d["power_w"] == 6300, d["power_w"]
+
+
+def test_pause_bez_stanu_c_albo_bez_mocy_to_zwykla_pauza():
+    c = make_ctrl()
+    for _ in range(ev.HIDDEN_CHARGE_ITERS + 2):
+        assert _odczyt(c, "PAUSE", CP_PODLACZONE, 90, 21)["status"] == "PAUSE"
+    for _ in range(ev.HIDDEN_CHARGE_ITERS + 2):
+        assert _odczyt(c, "PAUSE", CP_LADUJE, 0, 0)["status"] == "PAUSE"
+
+
+def test_koniec_ukrytego_ladowania_kasuje_licznik():
+    c = make_ctrl()
+    for _ in range(ev.HIDDEN_CHARGE_ITERS):
+        _odczyt(c, "PAUSE", CP_LADUJE, 90, 21)
+    assert _odczyt(c, "PAUSE", CP_LADUJE, 0, 0)["status"] == "PAUSE"
+    assert _odczyt(c, "PAUSE", CP_LADUJE, 90, 21)["status"] == "PAUSE"
+
+
+def test_pulap_zimowy_zostaje_10a():
+    # Decyzja z 6.11.2026: rezerwa na mrozniejsze noce.
+    assert ev.WINTER_MAX_CURRENT == 10
+
+
+# --- Obserwacja weekendu 7-9.11.2026 ---
+
+@_w_nocy
+def test_start_samoczynny_po_wlozeniu_kabla_ma_rampe():
+    # 7.11 11:49 i 8.11 13:17: wallbox zaczyna sam, bez naszego START. Zapas
+    # spadal do 1,2 i 2,2 A, bo auto znow wygladalo jak dom.
+    c = _zima()
+    c._apply_decision("IDLE", 0, charger("SLEEP", cp_volts=CP_ODPIETE))
+    zanim = ha_data(surplus_w=-3800, soc=20.0)
+    assert _iteracja(c, charger("WORKING", cp_volts=CP_LADUJE), zanim)[1] == 9
+    pelne = ha_data(surplus_w=-9500, soc=20.0)            # auto widziane jako dom
+    pelne["grid_power"] = -9.5
+    for _ in range(ev.START_SETTLE_ITERS - 1):
+        mode, target = _iteracja(c, charger("WORKING", current_a=9, cp_volts=CP_LADUJE), pelne)
+        assert (mode, target) == ("WINTER_NIGHT", 9), f"{mode}/{target}"
+    assert not c._device.switch_sends(), c._device.switch_sends()
+
+
+@_w_nocy
+def test_start_samoczynny_kasuje_stan_grid_limit():
+    c = _zima()
+    c._grid_limited = True
+    c._apply_decision(ev.GRID_LIMIT_MODE, 0, charger("PAUSE"))
+    assert _iteracja(c, charger("WORKING", cp_volts=CP_LADUJE),
+                     ha_data(surplus_w=-3800, soc=20.0))[0] == "WINTER_NIGHT"
+    assert c._grid_limited is False
+
+
+@_w_nocy
+def test_trwajaca_sesja_nie_dostaje_rampy():
+    c = _zima()
+    c._apply_decision("WINTER_NIGHT", 10, charger("WORKING", power_w=6200))
+    c._last_sent_current = 10
+    c._decide(ha_data(surplus_w=-4800, soc=20.0), charger("WORKING", power_w=6200))
+    assert c._grid_settle_left == 0
+
+
+def test_sesja_samoczynna_stop_od_razu():
+    # 7.11 13:03 i 8.11 13:26: skrypt pamietal STOP sprzed sesji, wiec pierwszy
+    # STOP szedl sciezka ponowien po 90 s, z falszywym "STOP bez efektu".
+    c = make_ctrl()
+    c._apply_decision("IDLE", 0, charger("PAUSE"))
+    assert c._last_sent_switch is False
+    c._apply_decision("WINTER_NIGHT", 10, charger("WORKING", power_w=3300))
+    c._apply_decision(ev.GRID_LIMIT_MODE, 0, charger("WORKING", power_w=3300))
+    assert [x[1] for x in c._device.switch_sends()] == [False], c._device.switch_sends()
+
+
+def test_stop_wyslany_nie_jest_powtarzany_od_razu():
+    # Nasz STOP i trwajaca sesja, bez zbocza statusu: dalej sciezka ponowien.
+    c = make_ctrl()
+    c._apply_decision("WINTER_NIGHT", 10, charger("WORKING", power_w=3300))
+    c._apply_decision("IDLE", 0, charger("WORKING", power_w=3300))
+    c._apply_decision("IDLE", 0, charger("WORKING", power_w=3300))
+    assert len(c._device.switch_sends()) == 1, c._device.switch_sends()
+
+
+@_w_nocy
+def test_pelne_auto_jedna_proba_i_jeden_start():
+    # 7-9.11: CAR_FULL co 3 h, po 2 komendy START, cala noc, przy CP 8,5 V.
+    c = _zima()
+    c._car_drew_power, c._car_full = True, True
+    stoi = '{"L1":[2300,0,0],"t":300}'
+    for _ in range(ev.CAR_FULL_RECHECK_ITERS * 8):           # 24 h
+        mode, _t = _iteracja(c, charger("IDLEINS", metrics_raw=stoi, cp_volts=8.5),
+                             ha_data(soc=20.0))
+    assert mode == ev.CAR_FULL_MODE, mode
+    starty = [x for x in c._device.switch_sends() if x[1] is True]
+    assert len(starty) == 1, f"ma byc jedna proba: {starty}"
+    assert not _pushes(c), _pushes(c)
+
+
+@_w_nocy
+def test_pelne_auto_odpiecie_przywraca_ponowna_probe():
+    c = _zima()
+    c._car_drew_power, c._car_full, c._car_full_rechecks = True, True, 1
+    c._decide(ha_data(soc=20.0), charger("IDLE", cp_volts=CP_ODPIETE))
+    assert c._car_full_rechecks == 0
+
+
+@_w_nocy
+def test_tryb_awaryjny_przywraca_ponowna_probe():
+    c = _zima({ev.EMERGENCY_MODE_ENTITY: "on"})
+    c._car_full, c._car_full_rechecks = True, 1
+    c._on_emergency_toggle(ev.EMERGENCY_MODE_ENTITY, None, "off", "on", {})
+    assert c._car_full_rechecks == 0
+
+
+@_w_nocy
+def test_auto_znow_pobiera_przywraca_ponowna_probe():
+    c = _zima()
+    c._car_drew_power, c._car_full, c._car_full_rechecks = True, True, 1
+    c._decide(ha_data(soc=20.0), charger("WORKING", power_w=3000))
+    assert c._car_full is False and c._car_full_rechecks == 0
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

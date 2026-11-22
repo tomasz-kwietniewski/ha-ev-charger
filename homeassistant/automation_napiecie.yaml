@@ -56,13 +56,14 @@ variables:
   # Co jest na której fazie - wg „wypis_obwodow_rozdzielnica.xlsx” (Google Drive Tomasza,
   # odczyt 22.11.2026). Obowiązuje kolumna „Faza”: komentarze „było Lx; podpięto do ... do L2”
   # to dawne przełączenia z elektrykami, które Tomasz cofnął (22.11.2026).
-  # Obwód 19 to już tylko mikrofala; nowy piekarnik jest na jednej z faz gniazda płyty
-  # indukcyjnej - na której, nie wiadomo.
+  # Obwód 19 to już tylko mikrofala; nowy piekarnik jest na L1 gniazda płyty indukcyjnej
+  # (obwód 42, Tomasz sprawdził 22.11.2026 czujnikiem sensor.pobor_fazy_l1).
+  # Pompy ciepła: 28 DUŻA na L2, 29 MAŁA na L3 (opis z rozdzielnicy).
   # Założenie: L1/L2/L3 z rozdzielnicy = R/S/T w Sofarze (niepotwierdzone pomiarem).
   odbiorniki: >-
-    {{ {'L1': 'bojler, suszarka, zmywarka, gniazdka w pokojach, oświetlenie zewnętrzne, domofon',
-        'L2': 'pompa ciepła, rekuperacja, lodówka z okapem, mikrofala, pralka w dużej łazience, łazienka, strych, część oświetlenia parteru',
-        'L3': 'pompa ciepła, pralka w pomieszczeniu technicznym, kuchnia nad blatem, jadalnia, salon TV, multimedia, sypialnia, korytarz z małą łazienką, część oświetlenia parteru'}[faza] }}
+    {{ {'L1': 'bojler, nowy piekarnik, suszarka, zmywarka, gniazdka w pokojach, oświetlenie zewnętrzne, domofon',
+        'L2': 'duża pompa ciepła, rekuperacja, lodówka z okapem, mikrofala, pralka w dużej łazience, łazienka, strych, część oświetlenia parteru',
+        'L3': 'mała pompa ciepła, pralka w pomieszczeniu technicznym, kuchnia nad blatem, jadalnia, salon TV, multimedia, sypialnia, korytarz z małą łazienką, część oświetlenia parteru'}[faza] }}
   flaga: "input_boolean.napiecie_alarm_{{ faza | lower }}"
   flagi:
     - input_boolean.napiecie_alarm_l1
@@ -117,7 +118,7 @@ actions:
                     {% else %}Za wysokie napięcie na fazie {{ faza }}{% endif %}
                   message: >-
                     {{ faza }}: {{ v }} V od 30 s (norma 207-253 V).
-                    Na {{ faza }}: {{ odbiorniki }}. Na wszystkich fazach: płyta indukcyjna (na jednej z nich nowy piekarnik) i ładowarka auta.
+                    Na {{ faza }}: {{ odbiorniki }}. Na wszystkich fazach: płyta indukcyjna i ładowarka auta.
                     Teraz: {{ opis }}.
                   data: *push
       # Powrót do normy - tylko gdy wcześniej poszedł alarm.

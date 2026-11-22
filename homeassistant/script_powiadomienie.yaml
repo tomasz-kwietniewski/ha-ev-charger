@@ -1,0 +1,81 @@
+# Wspólna wysyłka powiadomień z archiwum.
+# Tomasz 22.11.2026: kliknięcie w powiadomienie (zamiast w strzałkę „rozwiń”) otwiera HA
+# i treść znika z telefonu bez śladu. Dlatego każde powiadomienie z tego skryptu:
+# - trafia do dziennika HA (logbook.log na encji input_text.archiwum_powiadomien), który
+#   pokazuje widok „Powiadomienia” (/lovelace/powiadomienia); dziennik żyje tyle, co
+#   recorder (purge_keep_days 3650);
+# - otwiera po kliknięciu właśnie ten widok (clickAction), a nie ekran główny.
+#
+# Użycie:
+#   - action: script.powiadomienie
+#     data:
+#       tytul: "..."
+#       tresc: "..."
+#       odbiorcy: [mobile_app_tomek_vivo_x300_pro, mobile_app_ola_samsung_s23]
+#       tag: napiecie            # ten sam tag zastępuje poprzednie powiadomienie na telefonie
+#       kanal: Napięcie sieci    # kanał Androida
+#       ikona: mdi:flash-alert
+#
+# Wdrożenie: POST /api/config/script/config/powiadomienie (treść jako JSON).
+alias: "Powiadomienie z archiwum"
+description: >-
+  Push na wskazane telefony i wpis w dzienniku HA (widok Powiadomienia),
+  kliknięcie w push otwiera archiwum.
+mode: parallel
+max: 20
+fields:
+  tytul:
+    description: Tytuł powiadomienia
+    required: true
+    selector:
+      text:
+  tresc:
+    description: Treść powiadomienia
+    required: true
+    selector:
+      text:
+        multiline: true
+  odbiorcy:
+    description: Usługi notify bez prefiksu „notify.”
+    default:
+      - mobile_app_tomek_vivo_x300_pro
+    selector:
+      object:
+  tag:
+    description: Tag Androida (nowe powiadomienie o tym samym tagu zastępuje stare)
+    default: ha
+    selector:
+      text:
+  kanal:
+    description: Kanał powiadomień Androida
+    default: Home Assistant
+    selector:
+      text:
+  ikona:
+    description: Ikona w pasku powiadomień
+    default: mdi:home-assistant
+    selector:
+      text:
+sequence:
+  - action: logbook.log
+    data:
+      name: "{{ tytul }}"
+      message: "{{ tresc }}"
+      entity_id: input_text.archiwum_powiadomien
+  # Stanu input_text nie zmieniamy: zmiana stanu dałaby w dzienniku drugi, obcięty wpis.
+  - repeat:
+      for_each: "{{ odbiorcy if odbiorcy is list else [odbiorcy] }}"
+      sequence:
+        - action: "notify.{{ repeat.item }}"
+          continue_on_error: true
+          data:
+            title: "{{ tytul }}"
+            message: "{{ tresc }}"
+            data:
+              tag: "{{ tag }}"
+              channel: "{{ kanal }}"
+              importance: high
+              priority: high
+              ttl: 0
+              notification_icon: "{{ ikona }}"
+              clickAction: /lovelace/powiadomienia

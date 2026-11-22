@@ -53,6 +53,14 @@ variables:
     {{ {'sensor.sofar_logger_voltage_phase_r': 'L1',
         'sensor.sofar_logger_voltage_phase_s': 'L2',
         'sensor.sofar_logger_voltage_phase_t': 'L3'}[trigger.entity_id] }}
+  # Co jest na której fazie - wg „wypis_obwodow_rozdzielnica.xlsx” (Google Drive Tomasza,
+  # odczyt 22.11.2026). Obwody z komentarzem „było Lx; podpięto do ... do L2” liczone na L2.
+  # Trójfazowe (płyta indukcyjna z nowym piekarnikiem, ładowarka auta) - na wszystkich.
+  # Założenie: L1/L2/L3 z rozdzielnicy = R/S/T w Sofarze (niepotwierdzone pomiarem).
+  odbiorniki: >-
+    {{ {'L1': 'bojler, suszarka, gniazdka w pokojach, oświetlenie zewnętrzne, domofon',
+        'L2': 'pompa ciepła, rekuperacja, lodówka z okapem, piekarnik z mikrofalą, zmywarka, pralka w dużej łazience, multimedia, salon TV, sypialnia, łazienka, strych, część oświetlenia parteru',
+        'L3': 'pompa ciepła, pralka w pomieszczeniu technicznym, kuchnia nad blatem, jadalnia, korytarz z małą łazienką, część oświetlenia parteru'}[faza] }}
   flaga: "input_boolean.napiecie_alarm_{{ faza | lower }}"
   flagi:
     - input_boolean.napiecie_alarm_l1
@@ -107,6 +115,7 @@ actions:
                     {% else %}Za wysokie napięcie na fazie {{ faza }}{% endif %}
                   message: >-
                     {{ faza }}: {{ v }} V od 30 s (norma 207-253 V).
+                    Na {{ faza }}: {{ odbiorniki }}. Płyta indukcyjna i ładowarka auta są na wszystkich fazach.
                     Teraz: {{ opis }}.
                   data: *push
       # Powrót do normy - tylko gdy wcześniej poszedł alarm.
@@ -144,7 +153,7 @@ actions:
               - action: notify.mobile_app_tomek_vivo_x300_pro
                 data:
                   title: "Faza {{ faza }} wróciła do normy"
-                  message: "{{ faza }}: {{ v }} V. Teraz: {{ opis }}."
+                  message: "{{ faza }}: {{ v }} V ({{ odbiorniki }}). Teraz: {{ opis }}."
                   data:
                     tag: napiecie
                     channel: Napięcie sieci

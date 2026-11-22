@@ -1,0 +1,132 @@
+# Brak prądu z sieci - dom na magazynie. Push na oba telefony (Tomasz i Ola).
+# Tomasz 22.11.2026: przy zaniku sieci dom jedzie z magazynu Sofara i w domu tego nie widać,
+# a wtedy warto oszczędzać prąd, żeby magazyn wytrzymał dłużej.
+#
+# Sygnał: stan pracy falownika sensor.sofar_logger_inverter_status (rejestr 0x0404).
+# „Emergency power supply” = praca wyspowa z magazynu, bez sieci. To pewniejsze niż napięcie
+# faz (alarm napiecie_alarm), bo nie zależy od tego, po której stronie przełącznika
+# Encor SwitchBox Sofar mierzy napięcie.
+#
+# - start: zasilanie awaryjne przez 10 s - push z SOC, poborem domu i szacunkiem czasu;
+# - SOC spada poniżej 50 / 30 / 15% w trakcie - przypomnienie z nowym szacunkiem;
+# - koniec: falownik z powrotem „On-grid” przez 30 s - push z czasem trwania przerwy.
+# Flaga input_boolean.brak_sieci pamięta, że przerwa trwa (start nie powtarza się po
+# restarcie HA, koniec idzie tylko po starcie); jej last_changed to początek przerwy.
+#
+# Szacunek czasu: (SOC - rezerwa EPS) × 15 kWh / bieżący pobór domu. Przybliżony: pobór
+# zmienia się co chwilę, a falownik może trzymać rezerwę większą niż sensor.
+#
+# Wysyłka przez script.powiadomienie: wpis w dzienniku HA, klik otwiera /lovelace/powiadomienia.
+#
+# Wdrożenie: POST /api/config/automation/config/siec_eps (treść jako JSON).
+id: siec_eps
+alias: "Brak prądu z sieci - dom na magazynie"
+description: >-
+  Push na telefony Tomasza i Oli, gdy falownik przechodzi na zasilanie awaryjne
+  (brak sieci), przy spadku SOC magazynu w trakcie i gdy sieć wraca.
+mode: queued
+max: 10
+triggers:
+  - trigger: state
+    entity_id: sensor.sofar_logger_inverter_status
+    to: "Emergency power supply"
+    for:
+      seconds: 10
+    id: start
+  - trigger: numeric_state
+    entity_id: sensor.sofar_logger_battery
+    below: 50
+    id: soc
+  - trigger: numeric_state
+    entity_id: sensor.sofar_logger_battery
+    below: 30
+    id: soc
+  - trigger: numeric_state
+    entity_id: sensor.sofar_logger_battery
+    below: 15
+    id: soc
+  - trigger: state
+    entity_id: sensor.sofar_logger_inverter_status
+    to: "On-grid"
+    for:
+      seconds: 30
+    id: koniec
+variables:
+  soc: "{{ states('sensor.sofar_logger_battery') | float(0) }}"
+  rezerwa: "{{ states('sensor.sofar_logger_battery_eps_buffer') | float(5) }}"
+  pobor_kw: "{{ (states('sensor.sofar_logger_activepower_load_sys') | float(0) / 1000) | round(2) }}"
+  zapas_kwh: "{{ ([soc - rezerwa, 0] | max) / 100 * 15 }}"
+  szacunek: >-
+    {%- if pobor_kw < 0.1 -%}trudno oszacować (pobór bliski zera)
+    {%- else -%}
+      {%- set m = (zapas_kwh / pobor_kw * 60) | round(0) | int -%}
+      ok. {% if m >= 60 %}{{ m // 60 }} h {% endif %}{{ m % 60 }} min przy obecnym poborze
+    {%- endif -%}
+  stan: >-
+    Magazyn {{ soc | round(0) | int }}%, dom bierze {{ pobor_kw | round(1) }} kW,
+    wystarczy na {{ szacunek }}.
+  porada: "Wyłączcie, co się da: bojler, piekarnik, suszarkę, płytę indukcyjną, ładowanie auta."
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: start
+          - condition: state
+            entity_id: input_boolean.brak_sieci
+            state: "off"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.brak_sieci
+          - action: script.powiadomienie
+            data: &push
+              tytul: "Brak prądu z sieci - dom na magazynie"
+              tresc: "{{ stan }} {{ porada }}"
+              odbiorcy: &odbiorcy
+                - mobile_app_tomek_vivo_x300_pro
+                - mobile_app_ola_samsung_s23
+              tag: siec_eps
+              kanal: Brak prądu z sieci
+              ikona: mdi:home-battery
+      - conditions:
+          - condition: trigger
+            id: soc
+          - condition: state
+            entity_id: input_boolean.brak_sieci
+            state: "on"
+          - condition: state
+            entity_id: sensor.sofar_logger_inverter_status
+            state: "Emergency power supply"
+        sequence:
+          - action: script.powiadomienie
+            data:
+              tytul: "Wciąż bez prądu z sieci - magazyn {{ soc | round(0) | int }}%"
+              tresc: "{{ stan }} {{ porada }}"
+              odbiorcy: *odbiorcy
+              tag: siec_eps
+              kanal: Brak prądu z sieci
+              ikona: mdi:home-battery-outline
+      - conditions:
+          - condition: trigger
+            id: koniec
+          - condition: state
+            entity_id: input_boolean.brak_sieci
+            state: "on"
+        sequence:
+          - variables:
+              minuty: >-
+                {{ ((now() - states.input_boolean.brak_sieci.last_changed).total_seconds() / 60)
+                   | round(0) | int }}
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.brak_sieci
+          - action: script.powiadomienie
+            data:
+              tytul: "Prąd z sieci wrócił"
+              tresc: >-
+                Przerwa trwała {% if minuty >= 60 %}{{ minuty // 60 }} h {% endif %}{{ minuty % 60 }} min.
+                Magazyn {{ soc | round(0) | int }}%. Można wrócić do normalnego korzystania z prądu.
+              odbiorcy: *odbiorcy
+              tag: siec_eps
+              kanal: Brak prądu z sieci
+              ikona: mdi:transmission-tower

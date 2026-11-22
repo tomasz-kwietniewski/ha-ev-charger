@@ -13,6 +13,12 @@
 # Push o powrocie idzie tylko wtedy, gdy wcześniej poszedł alarm: pamiętają to helpery
 # input_boolean.napiecie_alarm_l1/l2/l3 (tworzone przez UI/WebSocket, nie YAML).
 #
+# Zanik sieci ma osobny, pewniejszy alarm siec_eps (stan falownika „Emergency power supply”,
+# push na oba telefony). Gdy falownik jest już na zasilaniu awaryjnym, ten alarm nie wysyła
+# własnego „Brak prądu z sieci” ani „Prąd z sieci wrócił”; robi to tylko wtedy, gdy napięcie
+# zniknęło, a falownik stanu awaryjnego nie zgłosił (flaga input_boolean.napiecie_brak_pradu_push).
+# Wysyłka przez script.powiadomienie: wpis w dzienniku HA i klik otwiera /lovelace/powiadomienia.
+#
 # Wdrożenie: POST /api/config/automation/config/napiecie_alarm (treść jako JSON).
 id: napiecie_alarm
 alias: "Napięcie sieci - zanik prądu i napięcie poza normą"
@@ -95,34 +101,45 @@ actions:
               - action: input_boolean.turn_on
                 target:
                   entity_id: "{{ flagi }}"
-              - action: notify.mobile_app_tomek_vivo_x300_pro
-                data:
-                  title: "Brak prądu z sieci"
-                  message: >-
-                    Napięcie zniknęło na wszystkich fazach ({{ opis }}).
-                    Dom działa z magazynu, SOC {{ soc }}%.
-                  data: &push
-                    tag: napiecie
-                    channel: Napięcie sieci
-                    importance: high
-                    priority: high
-                    ttl: 0
-                    notification_icon: mdi:transmission-tower-off
+              # Zanik sieci zgłasza siec_eps; tu tylko zapas na wypadek, gdyby falownik
+              # nie przeszedł w stan zasilania awaryjnego.
+              - if:
+                  - condition: template
+                    value_template: >-
+                      {{ not is_state('sensor.sofar_logger_inverter_status', 'Emergency power supply') }}
+                then:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: input_boolean.napiecie_brak_pradu_push
+                  - action: script.powiadomienie
+                    data:
+                      tytul: "Brak prądu z sieci"
+                      tresc: >-
+                        Napięcie zniknęło na wszystkich fazach ({{ opis }}).
+                        Dom działa z magazynu, SOC {{ soc }}%.
+                      odbiorcy: &odbiorcy
+                        - mobile_app_tomek_vivo_x300_pro
+                      tag: napiecie
+                      kanal: Napięcie sieci
+                      ikona: mdi:transmission-tower-off
             else:
               - action: input_boolean.turn_on
                 target:
                   entity_id: "{{ flaga }}"
-              - action: notify.mobile_app_tomek_vivo_x300_pro
+              - action: script.powiadomienie
                 data:
-                  title: >-
+                  tytul: >-
                     {% if v < 100 %}Brak napięcia na fazie {{ faza }}
                     {% elif v < 207 %}Za niskie napięcie na fazie {{ faza }}
                     {% else %}Za wysokie napięcie na fazie {{ faza }}{% endif %}
-                  message: >-
+                  tresc: >-
                     {{ faza }}: {{ v }} V od 30 s (norma 207-253 V).
                     Na {{ faza }}: {{ odbiorniki }}. Na wszystkich fazach: płyta indukcyjna i ładowarka auta.
                     Teraz: {{ opis }}.
-                  data: *push
+                  odbiorcy: *odbiorcy
+                  tag: napiecie
+                  kanal: Napięcie sieci
+                  ikona: mdi:transmission-tower-off
       # Powrót do normy - tylko gdy wcześniej poszedł alarm.
       - conditions:
           - condition: trigger
@@ -136,33 +153,33 @@ actions:
             then:
               - variables:
                   bylo_wszystkie: "{{ flagi | select('is_state', 'on') | list | count == 3 }}"
+                  byl_push_braku: "{{ is_state('input_boolean.napiecie_brak_pradu_push', 'on') }}"
               - action: input_boolean.turn_off
                 target:
-                  entity_id: "{{ flagi }}"
-              - action: notify.mobile_app_tomek_vivo_x300_pro
-                data:
-                  title: >-
-                    {% if bylo_wszystkie %}Prąd z sieci wrócił{% else %}Napięcie wróciło do normy{% endif %}
-                  message: "Wszystkie fazy w normie od 2 min: {{ opis }}."
-                  data:
-                    tag: napiecie
-                    channel: Napięcie sieci
-                    importance: high
-                    priority: high
-                    ttl: 0
-                    notification_icon: mdi:transmission-tower
+                  entity_id: "{{ flagi + ['input_boolean.napiecie_brak_pradu_push'] }}"
+              # Po zaniku sieci zgłoszonym przez siec_eps powrót też ogłasza siec_eps.
+              - if:
+                  - condition: template
+                    value_template: "{{ not bylo_wszystkie or byl_push_braku }}"
+                then:
+                  - action: script.powiadomienie
+                    data:
+                      tytul: >-
+                        {% if bylo_wszystkie %}Prąd z sieci wrócił{% else %}Napięcie wróciło do normy{% endif %}
+                      tresc: "Wszystkie fazy w normie od 2 min: {{ opis }}."
+                      odbiorcy: *odbiorcy
+                      tag: napiecie
+                      kanal: Napięcie sieci
+                      ikona: mdi:transmission-tower
             else:
               - action: input_boolean.turn_off
                 target:
                   entity_id: "{{ flaga }}"
-              - action: notify.mobile_app_tomek_vivo_x300_pro
+              - action: script.powiadomienie
                 data:
-                  title: "Faza {{ faza }} wróciła do normy"
-                  message: "{{ faza }}: {{ v }} V ({{ odbiorniki }}). Teraz: {{ opis }}."
-                  data:
-                    tag: napiecie
-                    channel: Napięcie sieci
-                    importance: high
-                    priority: high
-                    ttl: 0
-                    notification_icon: mdi:transmission-tower
+                  tytul: "Faza {{ faza }} wróciła do normy"
+                  tresc: "{{ faza }}: {{ v }} V ({{ odbiorniki }}). Teraz: {{ opis }}."
+                  odbiorcy: *odbiorcy
+                  tag: napiecie
+                  kanal: Napięcie sieci
+                  ikona: mdi:transmission-tower

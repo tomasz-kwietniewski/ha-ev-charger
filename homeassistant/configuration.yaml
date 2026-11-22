@@ -47,6 +47,19 @@ recorder:
       - sensor.lvl
       - sensor.szambo_cm_do_pelna
       - sensor.szambo   # atrybuty: lstEmpty, lstRead, bat
+      # Napięcie i pobór na fazach (wykresy na podstronach faz). Odczyt co ~6 s, więc
+      # surowe stany przycina do 14 dni automatyzacja recorder_przytnij_fazy;
+      # statystyki 5-min/godzinowe (średnia, min, max) zostają na stałe.
+      - sensor.sofar_logger_voltage_phase_r
+      - sensor.sofar_logger_voltage_phase_s
+      - sensor.sofar_logger_voltage_phase_t
+      - sensor.pobor_fazy_l1
+      - sensor.pobor_fazy_l2
+      - sensor.pobor_fazy_l3
+      # Brak prądu z sieci i archiwum powiadomień (widok Powiadomienia = dziennik tej encji)
+      - sensor.sofar_logger_inverter_status
+      - input_boolean.brak_sieci
+      - input_text.archiwum_powiadomien
 
 sensor:
   - platform: rest

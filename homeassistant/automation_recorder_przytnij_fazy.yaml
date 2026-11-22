@@ -1,0 +1,27 @@
+# Przycinanie surowej historii napięcia i poboru na fazach do 14 dni.
+# Recorder trzyma wszystko 3650 dni (szambo, archiwum energii), a te sześć czujników
+# zmienia się co ~6 s: bez przycinania to ok. 20 MB bazy na dobę. Statystyki długoterminowe
+# (5-min i godzinowe średnie, min, max) recorder.purge_entities zostawia, więc wykresy
+# z dłuższego okresu dalej działają, tylko z mniejszą rozdzielczością.
+#
+# Wdrożenie: POST /api/config/automation/config/recorder_przytnij_fazy (treść jako JSON).
+id: recorder_przytnij_fazy
+alias: "Recorder - przytnij historię faz do 14 dni"
+description: >-
+  Codziennie o 3:30 usuwa surowe stany napięcia i poboru na fazach starsze niż 14 dni.
+mode: single
+triggers:
+  - trigger: time
+    at: "03:30:00"
+actions:
+  - action: recorder.purge_entities
+    target:
+      entity_id:
+        - sensor.sofar_logger_voltage_phase_r
+        - sensor.sofar_logger_voltage_phase_s
+        - sensor.sofar_logger_voltage_phase_t
+        - sensor.pobor_fazy_l1
+        - sensor.pobor_fazy_l2
+        - sensor.pobor_fazy_l3
+    data:
+      keep_days: 14

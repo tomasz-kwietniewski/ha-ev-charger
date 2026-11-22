@@ -194,6 +194,16 @@ Zeszłej zimy napięcie na fazach potrafiło odjechać tak, że urządzenia prze
 
 **Pobór domu na fazie.** Do sprawdzania, co jest podłączone na której fazie, służą pomocniki szablonowe `sensor.pobor_fazy_l1/l2/l3` = moc wyjścia falownika na fazie minus moc PCC na tej fazie (PCC dodatni = eksport). Sama strona sieci nic tu nie pokaże: Sofar HYD oddaje moc na każdą fazę osobno (np. 70 / 740 / 410 W) i sprowadza PCC każdej fazy prawie do zera. Suma trzech faz zgadza się z `sensor.sofar_logger_activepower_load_sys` co do kilkudziesięciu watów. Włączenie urządzenia o znanym obwodzie (bojler, pompa ciepła) potwierdziło, że L1/L2/L3 z rozdzielnicy to R/S/T falownika.
 
+### Brak prądu z sieci - dom na magazynie (`automation_siec_eps.yaml`)
+
+Przy zaniku sieci przełącznik Encor SwitchBox przepina dom na falownik i w domu tego nie widać, a to właśnie moment, żeby oszczędzać prąd. Pewnym sygnałem jest stan pracy falownika `sensor.sofar_logger_inverter_status` (rejestr 0x0404): `On-grid` przy sieci, `Emergency power supply` przy pracy wyspowej. Automatyzacja `siec_eps` wysyła push na oba telefony domowników: po 10 s pracy awaryjnej (SOC, pobór domu i szacunek czasu: (SOC - rezerwa EPS) × 15 kWh / pobór), przy spadku SOC poniżej 50, 30 i 15% oraz po powrocie sieci, z czasem trwania przerwy. Alarm napięcia nie dubluje wtedy własnego komunikatu o braku prądu.
+
+### Archiwum powiadomień (`script_powiadomienie.yaml`)
+
+Kliknięcie w powiadomienie na Androidzie otwiera aplikację HA i treść znika z telefonu. Dlatego alarmy wysyłają przez wspólny skrypt `script.powiadomienie`: każdy push trafia też do dziennika HA (`logbook.log` na `input_text.archiwum_powiadomien`), a kliknięcie otwiera widok z kartą dziennika z 30 dni (`clickAction`).
+
+**Pułapka: recorder z listą `include`.** Gdy w `recorder:` jest `include`, zapisywane są **tylko** wymienione encje, a wpisy `logbook.log` z `entity_id` spoza listy przepadają po cichu. Wykresy historii pokazują wtedy tylko bieżący stan. Nowe encje do historii trzeba dopisać do listy i zrestartować rdzeń HA. Napięcie i pobór na fazach zmieniają się co ok. 6 s, więc ich surowe stany przycina do 14 dni `automation_recorder_przytnij_fazy.yaml` (`recorder.purge_entities`); statystyki 5-min i godzinowe zostają.
+
 ### Szambo (`automation_szambo*.yaml`, `szambo_historia.py`, `szambo_zapis.sh`)
 
 Alarm zapełnienia z odbiornika Aquilo w sieci lokalnej (bez chmury), watchdog ciszy czujnika (48 h) i trwała historia wywozów w CSV z podsumowaniem kosztów.
@@ -251,6 +261,9 @@ ha-ev-charger/
 │   ├── lovelace_ev_history_card.yaml  ← karty archiwum (wykres + tabela + przycisk)
 │   ├── migracja_sofar.py              ← przejście z SolaX Modbus na Solarman (i wycofanie)
 │   ├── automation_napiecie.yaml       ← push przy zaniku prądu i napięciu poza normą
+│   ├── automation_siec_eps.yaml       ← push, gdy dom jedzie z magazynu (brak sieci)
+│   ├── automation_recorder_przytnij_fazy.yaml ← przycinanie historii faz do 14 dni
+│   ├── script_powiadomienie.yaml      ← wspólna wysyłka pushy z archiwum w dzienniku HA
 │   ├── automation_szambo*.yaml        ← alarm, watchdog i historia szamba
 │   ├── szambo_historia.py             ← podsumowanie historii wywozów
 │   └── szambo_zapis.sh                ← dopisywanie zdarzeń do CSV

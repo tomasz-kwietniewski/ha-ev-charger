@@ -176,6 +176,28 @@ Wizualizacja (wykres + tabela) — patrz `homeassistant/lovelace_ev_history_card
 
 **Ręczna archiwizacja (opcjonalna):** pierwszy wpis pojawia się dopiero przy najbliższym przełomie miesiąca. Aby zobaczyć/przetestować archiwum od razu, utwórz pomocnik `input_button.ev_archiwizuj_teraz` (przez UI) i dodaj kartę przycisku z `lovelace_ev_history_card.yaml`. Naciśnięcie archiwizuje bieżący (niezamknięty) miesiąc z aktualnymi danymi, bez resetu liczników — wpis jest idempotentny po `YYYY-MM`, więc przy realnym przełomie zostanie nadpisany wartością końcową.
 
+## Poza ładowarką - inne automatyzacje domu
+
+Repo trzyma też kilka automatyzacji Home Assistanta, które nie sterują ładowarką, ale korzystają z tych samych danych falownika. Wdraża się je przez `POST /api/config/automation/config/<id>` (treść YAML jako JSON); opis i powody są w nagłówku każdego pliku.
+
+### Napięcie i pobór na fazach (`automation_napiecie.yaml`)
+
+Zeszłej zimy napięcie na fazach potrafiło odjechać tak, że urządzenia przestawały działać, a o krótkich wyłączeniach prądu nie wiedziałem, bo dom jedzie wtedy z magazynu. Automatyzacja `napiecie_alarm` wysyła push na telefon:
+
+| Sytuacja | Warunek | Push |
+|----------|---------|------|
+| Brak prądu z sieci | wszystkie fazy < 100 V przez 30 s | jeden komunikat, napięcia faz i SOC magazynu |
+| Napięcie poza normą | faza < 207 V albo > 253 V przez 30 s (PN-EN 50160, 230 V ±10%) | która faza, ile V i co jest na niej podłączone |
+| Powrót | 212-248 V przez 2 min | tylko po wcześniejszym alarmie (flagi `input_boolean.napiecie_alarm_l1/l2/l3`) |
+
+Źródło to `sensor.sofar_logger_voltage_phase_r/s/t` z Solarmana (odczyt co ok. 6 s, więc krótszych szpilek nie widać). Histereza 207/212 i 253/248 V nie pozwala alarmowi migać przy granicy.
+
+**Pobór domu na fazie.** Do sprawdzania, co jest podłączone na której fazie, służą pomocniki szablonowe `sensor.pobor_fazy_l1/l2/l3` = moc wyjścia falownika na fazie minus moc PCC na tej fazie (PCC dodatni = eksport). Sama strona sieci nic tu nie pokaże: Sofar HYD oddaje moc na każdą fazę osobno (np. 70 / 740 / 410 W) i sprowadza PCC każdej fazy prawie do zera. Suma trzech faz zgadza się z `sensor.sofar_logger_activepower_load_sys` co do kilkudziesięciu watów. Włączenie urządzenia o znanym obwodzie (bojler, pompa ciepła) potwierdziło, że L1/L2/L3 z rozdzielnicy to R/S/T falownika.
+
+### Szambo (`automation_szambo*.yaml`, `szambo_historia.py`, `szambo_zapis.sh`)
+
+Alarm zapełnienia z odbiornika Aquilo w sieci lokalnej (bez chmury), watchdog ciszy czujnika (48 h) i trwała historia wywozów w CSV z podsumowaniem kosztów.
+
 ## Konfiguracja — ważne stałe
 
 ```python
@@ -226,7 +248,12 @@ ha-ev-charger/
 │   └── ev_charger_secrets.json.example ← szablon danych urządzenia
 ├── homeassistant/
 │   ├── configuration.yaml             ← template sensory + utility meters
-│   └── lovelace_ev_history_card.yaml  ← karty archiwum (wykres + tabela + przycisk)
+│   ├── lovelace_ev_history_card.yaml  ← karty archiwum (wykres + tabela + przycisk)
+│   ├── migracja_sofar.py              ← przejście z SolaX Modbus na Solarman (i wycofanie)
+│   ├── automation_napiecie.yaml       ← push przy zaniku prądu i napięciu poza normą
+│   ├── automation_szambo*.yaml        ← alarm, watchdog i historia szamba
+│   ├── szambo_historia.py             ← podsumowanie historii wywozów
+│   └── szambo_zapis.sh                ← dopisywanie zdarzeń do CSV
 ├── tests/
 │   └── test_ev_charger.py             ← lekkie testy jednostkowe (bez zależności)
 └── docs/

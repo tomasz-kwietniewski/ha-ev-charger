@@ -948,6 +948,34 @@ def _pushes(c):
     return [kw for s, kw in c.service_calls if s == ev.NOTIFY_SERVICE]
 
 
+def test_push_goes_through_archive_script_to_both_phones():
+    """Push idzie przez script.powiadomienie (archiwum w dzienniku HA, klik otwiera
+    widok Powiadomienia), na oba telefony - jak wcześniej notify/notify."""
+    c = make_ctrl()
+    c._notify_push("EV: test", "treść testowa")
+    assert c.service_calls == [(ev.NOTIFY_SERVICE, {
+        "tytul": "EV: test", "tresc": "treść testowa",
+        "odbiorcy": ev.NOTIFY_ODBIORCY, "tag": "ev_ladowarka",
+        "kanal": "Ładowarka EV", "ikona": "mdi:ev-station"})]
+    assert ev.NOTIFY_SERVICE == "script/powiadomienie"
+    assert len(ev.NOTIFY_ODBIORCY) == 2
+
+
+def test_push_falls_back_to_notify_when_script_fails():
+    """Brak skryptu albo błąd wywołania nie może zgubić alarmu o awarii."""
+    c = make_ctrl()
+    orig = c.call_service
+
+    def call_service(service, **kw):
+        if service == ev.NOTIFY_SERVICE:
+            raise RuntimeError("script not found")
+        return orig(service, **kw)
+    c.call_service = call_service
+    c._notify_push("EV: test", "treść")
+    assert c.service_calls == [(ev.NOTIFY_FALLBACK_SERVICE,
+                                {"title": "EV: test", "message": "treść"})]
+
+
 @_z_komenda_restartu
 def test_auto_reboot_fires_instead_of_waiting_for_human():
     c = make_ctrl()
@@ -1559,8 +1587,8 @@ def test_auto_bez_poboru_od_podlaczenia_alarm_mowi_prawde():
         _iteracja(c, charger("PAUSE", metrics_raw=stoi), ha_data(soc=20.0))
     p = _pushes(c)
     assert p, "bez zadnego poboru w tym podlaczeniu alarm ma zostac"
-    assert "Nadwyżka PV" not in p[0]["message"], p[0]["message"]
-    assert "limit" in p[0]["message"], p[0]["message"]
+    assert "Nadwyżka PV" not in p[0]["tresc"], p[0]["tresc"]
+    assert "limit" in p[0]["tresc"], p[0]["tresc"]
 
 
 # --- Start ladowania: auto nie moze wygladac jak dom (2026-11-06) ---

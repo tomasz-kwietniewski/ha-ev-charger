@@ -219,7 +219,13 @@ AUTO_REBOOT_ENTITY = "input_boolean.ev_auto_restart"
 # tylko do jednej osoby, dostępne są też usługi per urządzenie:
 # notify/mobile_app_tomek_oneplus_12, notify/mobile_app_ola_samsung_s23.
 # Wysyłka potwierdzona na żywym HA 2026-08-20 — push dotarł na telefon.
-NOTIFY_SERVICE = "notify/notify"
+# Od 2026-11-22 push idzie przez script.powiadomienie (homeassistant/script_powiadomienie.yaml):
+# wpis w dzienniku HA (widok „Powiadomienia”) i klik w push otwiera to archiwum, bo zwykły
+# klik w Androidzie otwierał HA i treść ginęła. Odbiorcy jak wcześniej: oba telefony.
+# Gdy skryptu nie ma albo wywołanie padnie, zapas: bezpośrednio notify/notify.
+NOTIFY_SERVICE = "script/powiadomienie"
+NOTIFY_FALLBACK_SERVICE = "notify/notify"
+NOTIFY_ODBIORCY = ["mobile_app_tomek_vivo_x300_pro", "mobile_app_ola_samsung_s23"]
 
 # Tryby, w których skrypt świadomie chce ładować.
 ACTIVE_CHARGING_MODES = ("SOLAR", "EMERGENCY", "NEGATIVE_PRICE", "WINTER_NIGHT")
@@ -991,9 +997,17 @@ class EVChargerControl(hass.Hass):
         """Push na telefon. Panel HA zostaje jako drugi kanał — awaria
         18-19.08 przeleżała tam 22 godziny, zanim ktokolwiek ją zobaczył."""
         try:
-            self.call_service(NOTIFY_SERVICE, title=tytul, message=tresc)
+            self.call_service(NOTIFY_SERVICE, tytul=tytul, tresc=tresc,
+                              odbiorcy=NOTIFY_ODBIORCY, tag="ev_ladowarka",
+                              kanal="Ładowarka EV", ikona="mdi:ev-station")
+            return
         except Exception as e:
-            self.log(f"Push nie poszedl ({NOTIFY_SERVICE}): {e}", level="WARNING")
+            self.log(f"Push przez {NOTIFY_SERVICE} nie poszedl: {e}; "
+                     f"probuje {NOTIFY_FALLBACK_SERVICE}", level="WARNING")
+        try:
+            self.call_service(NOTIFY_FALLBACK_SERVICE, title=tytul, message=tresc)
+        except Exception as e:
+            self.log(f"Push nie poszedl ({NOTIFY_FALLBACK_SERVICE}): {e}", level="WARNING")
 
     def _notify_problem(self, message):
         try:

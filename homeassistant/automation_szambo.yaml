@@ -51,27 +51,28 @@ actions:
           - condition: template
             value_template: "{{ cm > 0 }}"
         sequence:
-          - action: notify.mobile_app_tomek_vivo_x300_pro
+          - action: script.powiadomienie
             data:
-              title: "Szambo: do pełna {{ cm | round(0) | int }} cm"
-              message: >-
+              tytul: "Szambo: do pełna {{ cm | round(0) | int }} cm"
+              tresc: >-
                 Zapełnienie {{ pct }}%. Napisz dziś do szambiarza, żeby przyjechał jutro.
                 Ostatnie opróżnienie: {{ oproznione }}.
-              data: &push
-                tag: szambo
-                channel: Szambo
-                importance: high
-                priority: high
-                ttl: 0
-                notification_icon: mdi:toilet
+              odbiorcy: &odbiorcy
+                - mobile_app_tomek_vivo_x300_pro
+              tag: szambo
+              kanal: Szambo
+              ikona: mdi:toilet
       - conditions:
           - condition: template
             value_template: "{{ trigger.id | default('') != 'prognoza' }}"
         sequence:
-          - action: notify.mobile_app_tomek_vivo_x300_pro
+          - action: script.powiadomienie
             data:
-              title: "Szambo pełne ({{ pct }}%)"
-              message: >-
+              tytul: "Szambo pełne ({{ pct }}%)"
+              tresc: >-
                 {% if cm < 0 %}Już {{ (-cm) | round(0) | int }} cm ponad stan pełny. {% endif %}Czas wezwać szambiarza, najlepiej dziś.
                 Ostatnie opróżnienie: {{ oproznione }}.
-              data: *push
+              odbiorcy: *odbiorcy
+              tag: szambo
+              kanal: Szambo
+              ikona: mdi:toilet

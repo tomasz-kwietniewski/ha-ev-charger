@@ -1,0 +1,154 @@
+# Alarm napięcia sieci - push na vivo Tomka przy zaniku prądu i przy napięciu poza normą.
+# Tomasz 22.11.2026: o wyłączeniach prądu w zasadzie nie wie (dom jedzie wtedy z magazynu
+# Sofara, NAS ma własny UPS na ok. 50 min), a zeszłej zimy napięcie na fazach potrafiło
+# tak odjechać, że urządzenia nie działały.
+#
+# Źródło: napięcie sieci po stronie falownika, sensor.sofar_logger_voltage_phase_r/s/t
+# (Solarman, odczyt co ok. 6 s). Krótkich szpilek poniżej 6 s Sofar i tak nie widzi.
+#
+# Progi: norma PN-EN 50160 to 230 V ±10%, czyli 207-253 V.
+# - alarm: poniżej 207 V albo powyżej 253 V przez 30 s;
+# - poniżej 100 V na wszystkich fazach naraz = brak prądu z sieci (jeden push, nie trzy);
+# - powrót: 212-248 V przez 2 min (histereza, żeby nie migało przy granicy).
+# Push o powrocie idzie tylko wtedy, gdy wcześniej poszedł alarm: pamiętają to helpery
+# input_boolean.napiecie_alarm_l1/l2/l3 (tworzone przez UI/WebSocket, nie YAML).
+#
+# Wdrożenie: POST /api/config/automation/config/napiecie_alarm (treść jako JSON).
+id: napiecie_alarm
+alias: "Napięcie sieci - zanik prądu i napięcie poza normą"
+description: >-
+  Push na vivo Tomka, gdy na fazie L1/L2/L3 napięcie jest poza 207-253 V przez 30 s
+  albo zniknie na wszystkich fazach (brak prądu z sieci), oraz gdy wróci do normy.
+mode: queued
+max: 10
+triggers:
+  - trigger: numeric_state
+    entity_id: &fazy
+      - sensor.sofar_logger_voltage_phase_r
+      - sensor.sofar_logger_voltage_phase_s
+      - sensor.sofar_logger_voltage_phase_t
+    below: 207
+    for:
+      seconds: 30
+    id: problem
+  - trigger: numeric_state
+    entity_id: *fazy
+    above: 253
+    for:
+      seconds: 30
+    id: problem
+  - trigger: numeric_state
+    entity_id: *fazy
+    above: 212
+    below: 248
+    for:
+      minutes: 2
+    id: norma
+variables:
+  encje:
+    - sensor.sofar_logger_voltage_phase_r
+    - sensor.sofar_logger_voltage_phase_s
+    - sensor.sofar_logger_voltage_phase_t
+  faza: >-
+    {{ {'sensor.sofar_logger_voltage_phase_r': 'L1',
+        'sensor.sofar_logger_voltage_phase_s': 'L2',
+        'sensor.sofar_logger_voltage_phase_t': 'L3'}[trigger.entity_id] }}
+  flaga: "input_boolean.napiecie_alarm_{{ faza | lower }}"
+  flagi:
+    - input_boolean.napiecie_alarm_l1
+    - input_boolean.napiecie_alarm_l2
+    - input_boolean.napiecie_alarm_l3
+  v: "{{ trigger.to_state.state | float(0) | round(0) | int }}"
+  napiecia: "{{ encje | map('states') | map('float', 0) | list }}"
+  brak_pradu: "{{ napiecia | max < 100 }}"
+  wszystkie_ok: "{{ napiecia | min >= 212 and napiecia | max <= 248 }}"
+  opis: >-
+    L1 {{ napiecia[0] | round(0) | int }} V, L2 {{ napiecia[1] | round(0) | int }} V,
+    L3 {{ napiecia[2] | round(0) | int }} V
+  soc: "{{ states('sensor.sofar_logger_battery') }}"
+actions:
+  - choose:
+      # Pierwszy alarm na tej fazie (kolejne trzyma flaga, dopóki napięcie nie wróci).
+      - conditions:
+          - condition: trigger
+            id: problem
+          - condition: template
+            value_template: "{{ is_state(flaga, 'off') }}"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ brak_pradu }}"
+            then:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: "{{ flagi }}"
+              - action: notify.mobile_app_tomek_vivo_x300_pro
+                data:
+                  title: "Brak prądu z sieci"
+                  message: >-
+                    Napięcie zniknęło na wszystkich fazach ({{ opis }}).
+                    Dom działa z magazynu, SOC {{ soc }}%.
+                  data: &push
+                    tag: napiecie
+                    channel: Napięcie sieci
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    notification_icon: mdi:transmission-tower-off
+            else:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: "{{ flaga }}"
+              - action: notify.mobile_app_tomek_vivo_x300_pro
+                data:
+                  title: >-
+                    {% if v < 100 %}Brak napięcia na fazie {{ faza }}
+                    {% elif v < 207 %}Za niskie napięcie na fazie {{ faza }}
+                    {% else %}Za wysokie napięcie na fazie {{ faza }}{% endif %}
+                  message: >-
+                    {{ faza }}: {{ v }} V od 30 s (norma 207-253 V).
+                    Teraz: {{ opis }}.
+                  data: *push
+      # Powrót do normy - tylko gdy wcześniej poszedł alarm.
+      - conditions:
+          - condition: trigger
+            id: norma
+          - condition: template
+            value_template: "{{ is_state(flaga, 'on') }}"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ wszystkie_ok }}"
+            then:
+              - variables:
+                  bylo_wszystkie: "{{ flagi | select('is_state', 'on') | list | count == 3 }}"
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: "{{ flagi }}"
+              - action: notify.mobile_app_tomek_vivo_x300_pro
+                data:
+                  title: >-
+                    {% if bylo_wszystkie %}Prąd z sieci wrócił{% else %}Napięcie wróciło do normy{% endif %}
+                  message: "Wszystkie fazy w normie od 2 min: {{ opis }}."
+                  data:
+                    tag: napiecie
+                    channel: Napięcie sieci
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    notification_icon: mdi:transmission-tower
+            else:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: "{{ flaga }}"
+              - action: notify.mobile_app_tomek_vivo_x300_pro
+                data:
+                  title: "Faza {{ faza }} wróciła do normy"
+                  message: "{{ faza }}: {{ v }} V. Teraz: {{ opis }}."
+                  data:
+                    tag: napiecie
+                    channel: Napięcie sieci
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    notification_icon: mdi:transmission-tower

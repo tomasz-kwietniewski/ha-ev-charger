@@ -94,6 +94,20 @@ actions:
           - condition: template
             value_template: "{{ is_state(flaga, 'off') }}"
         sequence:
+          # Falownik na zasilaniu awaryjnym = zanik sieci, który zgłasza siec_eps. Milczymy
+          # i zapalamy wszystkie flagi, żeby powrót też nie poszedł. 22.11.2026 realny zanik
+          # trwał ~34 s: po 30 s napięcie wracało (148 V), więc warunek „wszystkie < 100 V”
+          # nie zachodził i poszły trzy zbędne pushe „Brak napięcia na fazie”.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ is_state('sensor.sofar_logger_inverter_status', 'Emergency power supply')
+                     or is_state('input_boolean.brak_sieci', 'on') }}
+            then:
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: "{{ flagi }}"
+              - stop: "Zanik sieci - zgłasza siec_eps"
           - if:
               - condition: template
                 value_template: "{{ brak_pradu }}"

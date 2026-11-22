@@ -31,17 +31,15 @@ actions:
       ostatni: >-
         {%- set t = as_timestamp(state_attr('sensor.szambo', 'lstRead'), none) -%}
         {{ t | timestamp_custom('%d.%m.%Y %H:%M') if t else 'brak danych' }}
-  - action: notify.mobile_app_tomek_vivo_x300_pro
+  - action: script.powiadomienie
     data:
-      title: "Szambo: czujnik nie odpowiada"
-      message: >-
+      tytul: "Szambo: czujnik nie odpowiada"
+      tresc: >-
         {% if trigger.id | default('') == 'odbiornik' %}Odbiornik Aquilo nie odpowiada od 2 dób (sprawdź zasilanie i Wi-Fi).
         {% else %}Czujnik w zbiorniku nie przysłał odczytu od 2 dób (bateria albo zasięg).
         {% endif %}Ostatni odczyt: {{ ostatni }}. Do tego czasu alarm „3 cm / pełne” nie zadziała.
-      data:
-        tag: szambo_watchdog
-        channel: Szambo
-        importance: high
-        priority: high
-        ttl: 0
-        notification_icon: mdi:access-point-off
+      odbiorcy:
+        - mobile_app_tomek_vivo_x300_pro
+      tag: szambo_watchdog
+      kanal: Szambo
+      ikona: mdi:access-point-off

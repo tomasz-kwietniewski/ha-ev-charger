@@ -99,6 +99,9 @@ WATCHDOG_OK = (
     "{{ states('sensor.sofar_logger_battery') not in ['unavailable', 'unknown']"
     " and iv is not none and (now() - iv.last_updated).total_seconds() < 60 }}"
 )
+# Od 22.11.2026 przez script.powiadomienie (archiwum w dzienniku HA), na oba telefony jak notify.notify.
+WATCHDOG_PUSH = {"odbiorcy": ["mobile_app_tomek_vivo_x300_pro", "mobile_app_ola_samsung_s23"],
+                 "tag": "sofar_watchdog", "kanal": "Falownik", "ikona": "mdi:solar-power-variant"}
 WATCHDOG = {
     "id": WATCHDOG_ID,
     "alias": "Sofar - watchdog integracji Solarman",
@@ -111,18 +114,18 @@ WATCHDOG = {
         "{{ this.attributes.last_triggered is none or "
         "(now() - this.attributes.last_triggered).total_seconds() > 1800 }}"}],
     "actions": [
-        {"action": "notify.notify", "data": {
-            "title": "Sofar: brak danych",
-            "message": "Integracja Solarman nie daje danych od 10 min. Przeładowuję ją."}},
+        {"action": "script.powiadomienie", "data": {**WATCHDOG_PUSH,
+            "tytul": "Sofar: brak danych",
+            "tresc": "Integracja Solarman nie daje danych od 10 min. Przeładowuję ją."}},
         {"action": "homeassistant.reload_config_entry", "data": {"entry_id": SOLARMAN_ENTRY}},
         {"wait_template": WATCHDOG_OK, "timeout": "00:05:00", "continue_on_timeout": True},
         {"if": [{"condition": "template", "value_template": "{{ wait.completed }}"}],
-         "then": [{"action": "notify.notify", "data": {
-             "title": "Sofar: dane wróciły",
-             "message": "Po przeładowaniu integracji Solarman dane z falownika płyną."}}],
-         "else": [{"action": "notify.notify", "data": {
-             "title": "Sofar: przeładowanie nie pomogło",
-             "message": "Brak danych z falownika mimo przeładowania. Ładowarka nie "
+         "then": [{"action": "script.powiadomienie", "data": {**WATCHDOG_PUSH,
+             "tytul": "Sofar: dane wróciły",
+             "tresc": "Po przeładowaniu integracji Solarman dane z falownika płyną."}}],
+         "else": [{"action": "script.powiadomienie", "data": {**WATCHDOG_PUSH,
+             "tytul": "Sofar: przeładowanie nie pomogło",
+             "tresc": "Brak danych z falownika mimo przeładowania. Ładowarka nie "
                         "ładuje z PV. Sprawdź logger 192.168.50.15 i log HA."}}]},
     ],
     "mode": "single",

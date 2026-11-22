@@ -60,7 +60,8 @@ variables:
   # (obwód 42, Tomasz sprawdził 22.11.2026 czujnikiem sensor.pobor_fazy_l1).
   # Pompy ciepła: 28 DUŻA na L2, 29 MAŁA na L3 (opis z rozdzielnicy).
   # L1/L2/L3 z rozdzielnicy = R/S/T w Sofarze - potwierdzone pomiarem 22.11.2026
-  # (sensor.pobor_fazy_lx): bojler (27, L1) podbił L1, wyłączenie małej pompy (29, L3) zbiło L3.
+  # (sensor.pobor_fazy_lx): bojler (27, L1) podbił L1, wyłączenie dużej pompy (28, L2) zbiło L2,
+  # a wyłączenie małej pompy (29, L3) zbiło L3.
   odbiorniki: >-
     {{ {'L1': 'bojler, nowy piekarnik, suszarka, zmywarka, gniazdka w pokojach, oświetlenie zewnętrzne, domofon',
         'L2': 'duża pompa ciepła, rekuperacja, lodówka z okapem, mikrofala, pralka w dużej łazience, łazienka, strych, część oświetlenia parteru',
